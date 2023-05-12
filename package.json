@@ -1,10 +1,11 @@
 {
   "name": "roadsoft",
-  "version": "1.0.2",
+  "version": "1.0.5",
   "description": "Project to sync file to roadsoft server",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
+    "package": "electron-builder -p always",
     "build": "electron-packager . --asar --overwrite",
     "dist": "electron-builder --win --x64"
   },
@@ -26,19 +27,20 @@
   },
   "dependencies": {
     "@electron/remote": "^2.0.8",
+    "auto-launch": "^5.0.5",
     "axios": "^0.27.2",
+    "electron-log": "^5.0.0-beta.16",
     "electron-updater": "^5.3.0",
     "knex": "^2.2.0",
     "sqlite3": "^5.0.11"
   },
   "build": {
-    "appId": "com.roadsoft.sync",
-    "productName": "Roadsoft Sync",
-    "win": {
-      "target": "nsis"
-    },
-    "directories": {
-      "output": "dist"
-    }
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "RS-Roadsoft",
+        "repo": "roadsoft-import-app-public"
+      }
+    ]
   }
 }

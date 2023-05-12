@@ -1,3 +1,3 @@
 module.exports = {
-    baseUrl: "https://api.stg.rs-roadsoft.com"
+    baseUrl: "https://api-prod.rs-roadsoft.com"
 }
