@@ -210,7 +210,7 @@ ipcMain.on('sync:previousSchedule', async () => {
 async function connect(company_id, api_key) {
   var config = {
     method: 'get',
-    url: `${setting.baseUrl}/api/v1/tachofile/import/company/${company_id}/verify`,
+    url: `${setting.baseUrl}/api/v2/tachofile/import/company/${company_id}/verify`,
     headers: {
       'API-KEY': api_key
     }
@@ -297,7 +297,7 @@ async function syncFolder(folder) {
 
         var config = {
           method: 'post',
-          url: `${setting.baseUrl}/api/v1/tachofile/import/company/${companyId}`,
+          url: `${setting.baseUrl}/api/v2/tachofile/import/company/${companyId}`,
           headers: {
             'API-KEY': apiKey,
             'Content-Type': 'application/json'
@@ -329,7 +329,16 @@ async function syncFolder(folder) {
             console.log(error);
           });
 
-        fs.appendFileSync('log.txt', `[${new Date().toLocaleString()}] (Success) ${path.basename(file)} \n`);
+        // TODO Temporary fix for macos build. Logs either MacOS on develop or Win. Should be rethinking.
+        if (process.env.NODE_ENV === 'develop' && process.platform === 'darwin' || process.platform ==='win32') {
+           const logFilePath = path.join(process.cwd(), 'log.txt');
+
+            if (!fs.existsSync(logFilePath)) {
+              fs.writeFileSync(logFilePath, '', { flag: 'w' });
+            }
+
+            fs.appendFileSync(logFilePath,`[${new Date().toLocaleString()}] (Success) ${path.basename(file)}\n`);
+        }
       }
     });
   });
@@ -347,4 +356,4 @@ function wait(ms) {
       resolve(ms)
     }, ms)
   })
-}  
+}

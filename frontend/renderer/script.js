@@ -44,12 +44,19 @@ $("#connect").on("click", function() {
     connected = false;
     let companyId = $("#company-id").val();
     let apiKey = $("#api-key").val();
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-    if(companyId && apiKey) {
-        ipcRenderer.send("config:authenticate", { companyId, apiKey });
-    } else {
-        addLog("Please fill company id and api key.")
+     if (!companyId || !apiKey) {
+        addLog('Please fill company identifier and api key.');
+        return;
+     }
+  
+    if (!uuidRegex.test(companyId)) {
+        addLog('Company Identifier format is invalid. Example: 123e4567-e89b-12d3-a456-426614174000');
+        return;
     }
+  
+    ipcRenderer.send('config:authenticate', { companyId, apiKey });
 })
 
 ipcRenderer.on("sync:updateFiles", (e, message) => {

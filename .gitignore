@@ -1,2 +1,5 @@
-node_modules
-dist
+/node_modules
+/dist
+/roadsoft-darwin-arm64
+.DS_Store
+log.txt
