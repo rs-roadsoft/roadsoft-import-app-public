@@ -1,6 +1,6 @@
 {
   "name": "roadsoft",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "Project to sync file to roadsoft server",
   "main": "main.js",
   "scripts": {
@@ -9,7 +9,16 @@
     "package": "electron-builder -p always",
     "build": "electron-packager . --asar --overwrite",
     "dist": "electron-builder --win --x64",
-    "dist:mac": "npx electron-builder --mac"
+    "dist:mac": "npx electron-builder --mac",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
+  },
+  "lint-staged": {
+    "**/*.{js,ts,jsx,tsx,css,scss,md,json,html}": "prettier --write --ignore-path .prettierignore --ignore-unknown"
+  },
+  "simple-git-hooks": {
+    "pre-commit": "npx lint-staged",
+    "pre-push": "npm run format:check"
   },
   "repository": "https://github.com/RS-Roadsoft/roadsoft-import-app",
   "publish": {
@@ -28,7 +37,10 @@
     "electron-builder": "^23.6.0",
     "electron-packager": "^15.5.1",
     "electron-reload": "^2.0.0-alpha.1",
-    "electronmon": "^2.0.3"
+    "electronmon": "^2.0.3",
+    "lint-staged": "^16.2.6",
+    "prettier": "^3.6.2",
+    "simple-git-hooks": "^2.13.1"
   },
   "dependencies": {
     "@electron/remote": "^2.0.8",
