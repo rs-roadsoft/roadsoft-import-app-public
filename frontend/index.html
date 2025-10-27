@@ -34,6 +34,21 @@
         #logArea {
             font-family: 'Times New Roman', Times, serif;
         }
+              #dtBasicExample_length select {
+        background-color: #fff;
+      }
+
+      #dtBasicExample_filter input {
+        background-color: #fff;
+      }
+
+      #dtBasicExample_filter input:focus {
+        color: #495057;
+        background-color: #fff;
+        border-color: #80bdff;
+        outline: 0;
+        box-shadow: 0 0 0 0.2rem rgb(0 123 255 / 25%);
+      }
     </style>
 </head>
 <body>
@@ -50,7 +65,7 @@
             <div class="col-4">
                 <div class="md-form mt-0">
                     <input type="text" id="company-id" class="form-control">
-                    <label for="company-id">Company ID</label>
+                    <label for="company-id">Company Identifier</label>
                 </div>
             </div>
             <div class="col-5">
@@ -68,7 +83,7 @@
             <div class="col-3">
                 <div class="logs mb-3">
                     <label for="logs" class="logsText">Logs</label>
-                    <textarea name="" id="logArea" rows="6" class="form-control" readonly></textarea>
+                    <textarea name="" id="logArea" rows="6" class="form-control bg-white" readonly></textarea>
                 </div>
                 <button class="btn btn-secondary btn-block pb-10" id="select-folder"><i class="fa fa-folder-open-o" style="font-size: 14px;"></i>&nbsp;&nbsp; <span id="selectFolder">Select Folder</span></button>
                 <p class="mt-4">
@@ -97,7 +112,7 @@
             <div class="col-9 mb-4">
                 <div class="text-right mb-3" style="display: flex; justify-content: right;">
                     <select name="" id="changeLanguage" class="form-control" style="width: 20% !important;">
-                        <option value="">Chnage Language</option>
+                        <option value="">Change Language</option>
                         <option value="en">English</option>
                     </select>
                 </div>

@@ -1,10 +1,10 @@
 let languagePack = {
     en: {
-        companyId: "Company ID",
+        companyId: "Company Identifier",
         apiKey: "API Key",
         connect: "Connect",
         logs: "Logs",
-        selectFolder: "Select Folsder",
+        selectFolder: "Select Folder",
         currentFolder: "Current Folder",
         syncTrigger: "Sync Trigger",
         syncTriggerOptions: {
