@@ -1,0 +1,15 @@
+node_modules/
+dist/
+build/
+out/
+release/
+frontend/.vscode
+frontend/css
+frontend/images
+frontend/js
+
+app/
+package-lock.json
+*.asar
+logs/
+*.log
