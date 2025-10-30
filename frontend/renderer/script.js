@@ -177,7 +177,7 @@ ipcRenderer.on('sync:updateStatus', function (event, data) {
   if (fs.existsSync(data.fileName)) {
     //move to archieved
     fs.rename(data.fileName, path.join(path.dirname(data.fileName), 'Archived', filename), (err) => {
-      addLog(`Error moving file: ${err?.message}`);
+      if (err) addLog(`Error moving file: ${err?.message || err}`);
     });
   }
 
