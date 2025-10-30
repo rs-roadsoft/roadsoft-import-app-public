@@ -1,3 +1,6 @@
+// Comments are in English, UI text is unchanged.
+// renderer/script.js
+
 const electron = require('electron');
 const { ipcRenderer, shell } = electron;
 const { dialog } = require('@electron/remote');
@@ -95,12 +98,11 @@ $('#select-folder').on('click', async function () {
 
 /*
 =====================================
-        FILE DISCOVERY + UNZIP (UPDATED)
+        FILE DISCOVERY + UNZIP (NO BUFFERS)
 =====================================
 */
 
-// * Ensure special folders "Archived" and "Failed" exist in the root path
-
+// Ensure special folders exist at root path
 function ensureSpecialFolders(rootPath) {
   const archivedDir = path.join(rootPath, DIRS.ARCHIVED);
   const failedDir = path.join(rootPath, DIRS.FAILED);
@@ -117,19 +119,28 @@ function escapeHtml(str) {
   return String(str).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
+// Check if a row for the given absolute path already exists in the table
+function hasRowFor(fullPath) {
+  const indexes = filesDataTable
+    .rows()
+    .indexes()
+    .filter((idx) => {
+      const rowData = filesDataTable.row(idx).data();
+      return rowData && typeof rowData[0] === 'string' && rowData[0].includes(fullPath);
+    });
+  return indexes.length > 0;
+}
+
 /*
- * Recursively walk through "dirPath", up to maxDepth = 10, and:
- *  - unzip any .zip files we encounter (including nested zips)
- *  - collect every .ddd /.esm file we find (from any subfolder)
- * We skip "Archived" and "Failed" top-level folders to avoid reprocessing old data.
+ * Recursively walk "dirPath" (max depth 10):
+ *  - unzip any .zip we encounter (including nested zips)
+ *  - immediately add every .ddd/.esm found as a row (no intermediate arrays/Sets)
+ *  - skip top-level "Archived" and "Failed"
  */
-async function scanAndUnpack(rootPath, dirPath, depth, collectedFiles) {
-  if (depth > MAX_SCAN_DEPTH) {
-    return;
-  }
+async function scanAndUnpack(rootPath, dirPath, depth) {
+  if (depth > MAX_SCAN_DEPTH) return;
 
   let entries;
-
   try {
     entries = fs.readdirSync(dirPath, { withFileTypes: true });
   } catch (err) {
@@ -140,7 +151,7 @@ async function scanAndUnpack(rootPath, dirPath, depth, collectedFiles) {
   for (const entry of entries) {
     const full = path.join(dirPath, entry.name);
 
-    // Skip "Archived" and "Failed" folders at the root level.
+    // Skip "Archived" and "Failed" at root level
     if (
       depth === 0 &&
       entry.isDirectory() &&
@@ -151,14 +162,13 @@ async function scanAndUnpack(rootPath, dirPath, depth, collectedFiles) {
     }
 
     if (entry.isDirectory()) {
-      // Recurse into subdirectory
-      await scanAndUnpack(rootPath, full, depth + 1, collectedFiles);
+      await scanAndUnpack(rootPath, full, depth + 1);
     } else {
       const ext = path.extname(entry.name).toLowerCase();
 
       if (ext === EXT.ZIP) {
+        // snapshot before
         const beforeNames = new Set();
-
         try {
           fs.readdirSync(dirPath).forEach((n) => beforeNames.add(n));
         } catch (snapErr) {
@@ -166,19 +176,20 @@ async function scanAndUnpack(rootPath, dirPath, depth, collectedFiles) {
         }
 
         try {
-          // Try to extractzip INTO dirPath
+          // Extract into current directory
           await extractZip(full, { dir: dirPath });
 
-          // On success -> delete original archive
+          // Remove original archive
           fs.unlinkSync(full);
 
           addLog(`[Unzip] Extracted ${entry.name}`);
 
-          await scanAndUnpack(rootPath, dirPath, depth, collectedFiles);
+          // Rescan current directory (do not increase depth)
+          await scanAndUnpack(rootPath, dirPath, depth);
         } catch (zipErr) {
           addLog(`[Unzip Error] ${entry.name}: ${zipErr.message}`);
 
-          // Snapshot AFTER failed extraction
+          // Cleanup any partially created items
           let afterNames = [];
           try {
             afterNames = fs.readdirSync(dirPath);
@@ -188,18 +199,12 @@ async function scanAndUnpack(rootPath, dirPath, depth, collectedFiles) {
 
           const newlyCreated = afterNames.filter((name) => !beforeNames.has(name));
 
-          // helper: recursive delete for cleanup
           const rmRecursiveSafe = (targetPath) => {
             if (!fs.existsSync(targetPath)) return;
-
             try {
               const stat = fs.statSync(targetPath);
-
               if (stat.isDirectory()) {
-                // Recursively remove directory
-                fs.readdirSync(targetPath).forEach((child) => {
-                  rmRecursiveSafe(path.join(targetPath, child));
-                });
+                fs.readdirSync(targetPath).forEach((child) => rmRecursiveSafe(path.join(targetPath, child)));
                 fs.rmdirSync(targetPath);
               } else {
                 fs.unlinkSync(targetPath);
@@ -209,20 +214,14 @@ async function scanAndUnpack(rootPath, dirPath, depth, collectedFiles) {
             }
           };
 
-          // Remove all partially-created junk
-          newlyCreated.forEach((name) => {
-            const junkPath = path.join(dirPath, name);
-            rmRecursiveSafe(junkPath);
-          });
+          newlyCreated.forEach((name) => rmRecursiveSafe(path.join(dirPath, name)));
 
-          // Now move the zip itself to Failed
-          const failedDir = path.join(rootPath, 'Failed');
+          // Move bad zip to /Failed
+          const failedDir = path.join(rootPath, DIRS.FAILED);
           if (!fs.existsSync(failedDir)) {
             fs.mkdirSync(failedDir);
           }
-
           const failedTarget = path.join(failedDir, path.basename(full));
-
           try {
             fs.renameSync(full, failedTarget);
           } catch (moveErr) {
@@ -230,38 +229,23 @@ async function scanAndUnpack(rootPath, dirPath, depth, collectedFiles) {
           }
         }
       } else if (ext === EXT.DDD || ext === EXT.ESM) {
-        // Store file info to show in table
-        collectedFiles.push({
-          fullPath: full,
-          relativePath: path.relative(rootPath, full),
-        });
+        // Immediately add row for this file if not present already
+        if (!hasRowFor(full)) {
+          const relative = path.relative(rootPath, full);
+          addNewFile(full, relative);
+        }
       }
     }
   }
 }
 
 async function getFilesFromFolder(folderPath) {
+  // Rebuild table (fresh list of files)
   filesDataTable.clear().draw();
-
-  // Make sure special folders exist.
   ensureSpecialFolders(folderPath);
 
-  // We'll collect discovered .ddd/.esm files here
-  const collectedFiles = [];
-
-  // Recursively walk, unzip, and gather files
-  await scanAndUnpack(folderPath, folderPath, 0, collectedFiles);
-
-  // De-duplicate in case recursion added same file twice after nested zips
-  const uniqueByFullPath = {};
-
-  collectedFiles.forEach((f) => {
-    uniqueByFullPath[f.fullPath] = f;
-  });
-
-  Object.values(uniqueByFullPath).forEach((fileObj) => {
-    addNewFile(fileObj.fullPath, fileObj.relativePath);
-  });
+  // Incremental walk: rows are added on the fly (no collectors)
+  await scanAndUnpack(folderPath, folderPath, 0);
 }
 
 function addNewFile(fullPath, relativeDisplay) {
@@ -326,25 +310,23 @@ $('#sync-now').on('click', function () {
 =====================================
 */
 
+// Flip all rows to "Synchronizing" at sync start (row-wise, not a full rebuild)
 function changeStatusToProcessing() {
   filesDataTable.rows((idx, data, node) => {
-    if (data[2] === 'Not Synced') {
+    if (data[2] === 'Not Synced' || /Synchro/i.test(String(data[2]))) {
       filesDataTable
         .row(idx)
-        .data([data[0], data[1], '<i class="fa fa-refresh fa-spin"></i>&nbsp;&nbsp; Syncronizing'])
-        .draw();
+        .data([data[0], data[1], '<i class="fa fa-refresh fa-spin"></i>&nbsp;&nbsp; Synchronizing'])
+        .draw(false);
     }
   });
 }
 
 /*
- * We now:
- *   1. Decide target ("Archived" for Synced, "Failed" for Not Synced).
- *   2. Move either:
- *        - just the single file (if it lives directly in root folder),
- *        - OR the whole top-level subfolder (if file was inside subfolder)
- *      into /Archived or /Failed.
- *      After moving, the original file/subfolder disappears from root.
+ * Per-file status update:
+ *  - find the row by hidden absolute path cell
+ *  - move file or its top-level folder to Archived/Failed
+ *  - update only that row's status
  */
 ipcRenderer.on('sync:updateStatus', function (event, data) {
   const absoluteFilePath = data.fileName;
@@ -353,7 +335,7 @@ ipcRenderer.on('sync:updateStatus', function (event, data) {
   const rowIndexes = filesDataTable
     .rows()
     .indexes()
-    .filter(function (value /*idx*/, index) {
+    .filter(function (value) {
       const rowData = filesDataTable.row(value).data();
       return rowData[0].includes(absoluteFilePath);
     });
@@ -367,30 +349,23 @@ ipcRenderer.on('sync:updateStatus', function (event, data) {
   }
 
   if (fs.existsSync(absoluteFilePath)) {
-    // relative path from rootFolder to this file
     const relativeFromRoot = path.relative(rootFolder, absoluteFilePath);
     const parts = relativeFromRoot.split(path.sep);
 
     if (parts.length === 1) {
-      // Case 1: file is directly in the rootFolder
       const destFilePath = path.join(targetRootDir, path.basename(absoluteFilePath));
+
       fs.rename(absoluteFilePath, destFilePath, (err) => {
-        if (err) {
-          addLog(`Error moving file: ${err?.message}`);
-        }
+        if (err) addLog(`Error moving file: ${err?.message}`);
       });
     } else {
-      // Case 2: file is inside a subfolder
-      // So here we figure out that top-level subfolder name under rootFolder, and move that whole subfolder.
-      const topLevelFolderName = parts[0]; // first segment under root
+      const topLevelFolderName = parts[0];
       const srcTopFolderPath = path.join(rootFolder, topLevelFolderName);
       const destTopFolderPath = path.join(targetRootDir, topLevelFolderName);
 
       if (fs.existsSync(srcTopFolderPath)) {
         fs.rename(srcTopFolderPath, destTopFolderPath, (err) => {
-          if (err) {
-            addLog(`Error moving folder: ${err?.message}`);
-          }
+          if (err) addLog(`Error moving folder: ${err?.message}`);
         });
       }
     }
@@ -399,8 +374,7 @@ ipcRenderer.on('sync:updateStatus', function (event, data) {
   if (rowIndexes.length > 0) {
     const rowIdx = rowIndexes[0];
     const rowData = filesDataTable.row(rowIdx).data();
-
-    filesDataTable.row(rowIdx).data([rowData[0], rowData[1], data.status]).draw();
+    filesDataTable.row(rowIdx).data([rowData[0], rowData[1], data.status]).draw(false);
   }
 });
 
