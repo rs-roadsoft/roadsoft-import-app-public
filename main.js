@@ -11,7 +11,6 @@ const log = require('electron-log');
 const AutoLaunch = require('auto-launch');
 const dbConfig = require('./models/settings');
 const setting = require('./setting');
-
 const MAX_SCAN_DEPTH = 10;
 const DIRS = Object.freeze({ ARCHIVED: 'Archived', FAILED: 'Failed' });
 const EXT = Object.freeze({ DDD: '.ddd', ESM: '.esm' });
@@ -204,6 +203,7 @@ function gatherSyncFiles(rootDir, currentDir = rootDir, depth = 0, maxDepth = MA
       gatherSyncFiles(rootDir, fullPath, depth + 1, maxDepth, collected);
     } else {
       const ext = path.extname(entry.name).toLowerCase();
+
       if (ext === EXT.DDD || ext === EXT.ESM) {
         collected.push(fullPath);
       }

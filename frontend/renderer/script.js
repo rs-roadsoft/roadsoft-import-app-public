@@ -322,11 +322,40 @@ function changeStatusToProcessing() {
   });
 }
 
+/* -----------------------------------
+ * Safe remove helper (overwrite support)
+ * -----------------------------------
+ *
+ * Removes a file or directory recursively if it exists.
+ * This is used to implement "replace if exists" behavior when moving
+ * files/folders into Archived/Failed.
+ */
+function removePathRecursiveSyncSafe(targetPath) {
+  if (!fs.existsSync(targetPath)) return;
+
+  try {
+    const stat = fs.lstatSync(targetPath);
+
+    if (stat.isDirectory()) {
+      // Remove contents first
+      fs.readdirSync(targetPath).forEach((name) => {
+        removePathRecursiveSyncSafe(path.join(targetPath, name));
+      });
+      fs.rmdirSync(targetPath);
+    } else {
+      fs.unlinkSync(targetPath);
+    }
+  } catch (err) {
+    addLog(`Remove error for ${targetPath}: ${err.message}`);
+  }
+}
+
 /*
  * Per-file status update:
  *  - find the row by hidden absolute path cell
  *  - move file or its top-level folder to Archived/Failed
  *  - update only that row's status
+ *  - NEW: if destination exists (file or folder) — replace it atomically by removing first
  */
 ipcRenderer.on('sync:updateStatus', function (event, data) {
   const absoluteFilePath = data.fileName;
@@ -353,17 +382,29 @@ ipcRenderer.on('sync:updateStatus', function (event, data) {
     const parts = relativeFromRoot.split(path.sep);
 
     if (parts.length === 1) {
+      // Top-level file
       const destFilePath = path.join(targetRootDir, path.basename(absoluteFilePath));
+
+      // Ensure overwrite semantics on all platforms
+      if (fs.existsSync(destFilePath)) {
+        removePathRecursiveSyncSafe(destFilePath);
+      }
 
       fs.rename(absoluteFilePath, destFilePath, (err) => {
         if (err) addLog(`Error moving file: ${err?.message}`);
       });
     } else {
+      // File is inside a subfolder: move entire top-level folder
       const topLevelFolderName = parts[0];
       const srcTopFolderPath = path.join(rootFolder, topLevelFolderName);
       const destTopFolderPath = path.join(targetRootDir, topLevelFolderName);
 
       if (fs.existsSync(srcTopFolderPath)) {
+        // NEW: replace destination folder if it already exists
+        if (fs.existsSync(destTopFolderPath)) {
+          removePathRecursiveSyncSafe(destTopFolderPath);
+        }
+
         fs.rename(srcTopFolderPath, destTopFolderPath, (err) => {
           if (err) addLog(`Error moving folder: ${err?.message}`);
         });

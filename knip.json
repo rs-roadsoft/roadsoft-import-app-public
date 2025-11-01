@@ -1,0 +1,17 @@
+{
+  "$schema": "https://unpkg.com/knip@5/schema.json",
+  "entry": [
+    "main.js",
+    "preload.{js,ts}",
+    "preload/**/*.{js,ts}",
+    "renderer.{js,ts,tsx}",
+    "renderer/**/*.{js,ts,tsx}",
+    "src/renderer/**/*.{js,ts,tsx}"
+  ],
+  "project": ["**/*.{js,ts,jsx,tsx}", "!dist/**", "!build/**", "!out/**", "!release/**"],
+  "ignoreFiles": ["**/*.d.ts", "**/*.generated.*", "node_modules/**", "dist/**", "build/**", "out/**", "release/**"],
+  "ignoreIssues": {
+    "assets/**": ["files"],
+    "resources/**": ["files"]
+  }
+}
