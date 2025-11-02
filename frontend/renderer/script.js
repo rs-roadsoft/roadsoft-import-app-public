@@ -1,6 +1,3 @@
-// Comments are in English, UI text is unchanged.
-// renderer/script.js
-
 const electron = require('electron');
 const { ipcRenderer, shell } = electron;
 const { dialog } = require('@electron/remote');

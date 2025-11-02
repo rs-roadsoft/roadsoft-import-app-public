@@ -373,7 +373,7 @@ async function syncFolder(folder) {
   filesToSync.forEach((file) => {
     const data = JSON.stringify({
       fileName: path.basename(file),
-      downloadDate: '2021-04-22T08:33:00',
+      downloadDate: new Date().toISOString().split('.')[0],
       fileBytes: fs.readFileSync(file, { encoding: 'base64' }),
     });
 
@@ -395,7 +395,7 @@ async function syncFolder(folder) {
           });
         } else {
           mainWindow.webContents.send('sync:updateStatus', {
-            code: 401,
+            code: response.status,
             message: 'Error occured by API',
             fileName: file,
             status: 'Not Synced',
