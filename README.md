@@ -54,7 +54,3 @@ npm run build
 ## Project Publish
 
 npx electron-builder --win --x64 -p always
-
-## Unused files/imports
-
-npx knip

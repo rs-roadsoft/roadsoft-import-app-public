@@ -3,14 +3,17 @@ const electron = require('electron');
 const { app, BrowserWindow, Tray, Menu } = electron;
 const { ipcMain } = electron;
 require('@electron/remote/main').initialize();
-var axios = require('axios');
+
+const axios = require('axios');
 const path = require('path');
 const fs = require('fs');
-const { autoUpdater, AppUpdater } = require('electron-updater');
+const { autoUpdater } = require('electron-updater');
 const log = require('electron-log');
 const AutoLaunch = require('auto-launch');
+
 const dbConfig = require('./models/settings');
 const setting = require('./setting');
+
 const MAX_SCAN_DEPTH = 10;
 const DIRS = Object.freeze({ ARCHIVED: 'Archived', FAILED: 'Failed' });
 const EXT = Object.freeze({ DDD: '.ddd', ESM: '.esm' });
@@ -46,11 +49,9 @@ function createWindow() {
     },
     show: false,
   });
-
   require('@electron/remote/main').enable(mainWindow.webContents);
 
   mainWindow.loadFile(path.join(__dirname, 'frontend/index.html'));
-
   mainWindow.maximize();
   mainWindow.show();
 
@@ -79,8 +80,7 @@ function createWindow() {
 function createTray() {
   tray = new Tray(path.join(__dirname, 'frontend/images/app.png'));
   tray.setToolTip('RoadSoft');
-
-  var contextMenu = Menu.buildFromTemplate([
+  const contextMenu = Menu.buildFromTemplate([
     {
       label: 'Show App',
       click: function () {
@@ -96,9 +96,7 @@ function createTray() {
       },
     },
   ]);
-
   tray.setContextMenu(contextMenu);
-
   tray.on('click', () => {
     mainWindow.show();
     mainWindow.maximize();
@@ -121,7 +119,7 @@ app.whenReady().then(() => {
   autoUpdater.checkForUpdatesAndNotify();
 
   // auto-launch on login
-  let autoLaunch = new AutoLaunch({
+  const autoLaunch = new AutoLaunch({
     name: 'roadsoft',
     path: app.getPath('exe'),
   });
@@ -130,12 +128,7 @@ app.whenReady().then(() => {
   });
 });
 
-/*
-=====================================
-        Auto Update
-=====================================
-*/
-
+/* ===================================== Auto Update ===================================== */
 autoUpdater.on('update-available', () => {
   log.info('update-available');
   autoUpdater.downloadUpdate();
@@ -156,21 +149,16 @@ autoUpdater.on('update-downloaded', () => {
 });
 
 // end of auto update
-
 app.on('window-all-closed', function () {
   if (process.platform !== PLATFORMS.MAC) app.quit();
 });
 
-/*
-=====================================
-        HELPER: collect files recursively
-=====================================
-*/
-
-/*
+/* ===================================== HELPER: collect files recursively ===================================== */
+/**
  * Recursively walk a directory (depth-limited) and collect .ddd/.esm files from all subfolders (including nested subfolders).
  * - Skips the special folders "Archived" and "Failed" at the top level.
  * - Max depth: 10
+ * NOTE: main process only READS files; all moving/deleting is handled (safely) in renderer with path guards.
  */
 function gatherSyncFiles(rootDir, currentDir = rootDir, depth = 0, maxDepth = MAX_SCAN_DEPTH, collected = []) {
   if (depth > maxDepth) {
@@ -178,7 +166,6 @@ function gatherSyncFiles(rootDir, currentDir = rootDir, depth = 0, maxDepth = MA
   }
 
   let entries;
-
   try {
     entries = fs.readdirSync(currentDir, { withFileTypes: true });
   } catch (err) {
@@ -203,7 +190,6 @@ function gatherSyncFiles(rootDir, currentDir = rootDir, depth = 0, maxDepth = MA
       gatherSyncFiles(rootDir, fullPath, depth + 1, maxDepth, collected);
     } else {
       const ext = path.extname(entry.name).toLowerCase();
-
       if (ext === EXT.DDD || ext === EXT.ESM) {
         collected.push(fullPath);
       }
@@ -213,15 +199,11 @@ function gatherSyncFiles(rootDir, currentDir = rootDir, depth = 0, maxDepth = MA
   return collected;
 }
 
-/*
-=====================================
-        IPC Communication
-=====================================
-*/
+/* ===================================== IPC Communication ===================================== */
+
 //pre sets
 ipcMain.on('dbConfig:getPreset', async () => {
-  let syncSchedule = await dbConfig.getSetting('sync_schedule');
-
+  const syncSchedule = await dbConfig.getSetting('sync_schedule');
   mainWindow.webContents.send('dbConfig:setPreset', {
     companyId,
     apiKey,
@@ -245,12 +227,12 @@ ipcMain.on('dbConfig:setFolderPath', async (e, newFolderPath) => {
 
 // previous schedule
 ipcMain.on('sync:previousSchedule', async () => {
-  let scheduleTrigger = await dbConfig.getSetting('sync_schedule');
+  const scheduleTrigger = await dbConfig.getSetting('sync_schedule');
 
   if (scheduleTrigger && folderPath) {
     mainWindow.webContents.send('system:log', 'Sync scheduled: ' + scheduleTrigger);
-    let connection = await connect(companyId, apiKey);
 
+    const connection = await connect(companyId, apiKey);
     if (connection) {
       if (scheduleTrigger == 'application_start') {
         if (scheduleId) {
@@ -284,8 +266,7 @@ async function connect(company_id, api_key) {
   };
 
   try {
-    let response = await axios(config);
-
+    const response = await axios(config);
     if (response) {
       apiKey = api_key;
       companyId = company_id;
@@ -293,7 +274,6 @@ async function connect(company_id, api_key) {
       dbConfig.setSetting('company_id', companyId);
       dbConfig.refreshLastSync();
       mainWindow.webContents.send('config:success');
-
       return true;
     }
   } catch (error) {
@@ -305,7 +285,6 @@ async function connect(company_id, api_key) {
 
 ipcMain.on('sync:schedule', async (_, trigger) => {
   await dbConfig.setSetting('sync_schedule', trigger);
-
   if (trigger == 'application_start') {
     if (scheduleId) {
       try {
@@ -329,32 +308,24 @@ ipcMain.on('sync:schedule', async (_, trigger) => {
 });
 
 function scheduleSyncOnHour(hour) {
-  // remove old task
+  // remove old task if
   if (scheduleId) {
     try {
       clearInterval(scheduleId);
     } catch (error) {}
   }
-
   scheduleId = setInterval(() => syncFolder(folderPath), 1000 * 60 * 60 * hour);
 }
 
 ipcMain.on('sync:start', async () => {
-  let connection = await connect(companyId, apiKey);
-
+  const connection = await connect(companyId, apiKey);
   if (connection) syncFolder(folderPath);
 });
 
-/*
-=====================================
-        SYNC LOGIC (updated)
-=====================================
-*/
-
+/* ===================================== SYNC LOGIC (updated) ===================================== */
 async function syncFolder(folder) {
   if (!folder) {
     mainWindow.webContents.send('system:log', 'No folder selected for sync.');
-
     return;
   }
 
@@ -362,7 +333,6 @@ async function syncFolder(folder) {
   mainWindow.webContents.send('sync:updateFiles');
 
   await wait(2000);
-
   mainWindow.webContents.send('sync:changeStatusToProcessing');
   mainWindow.webContents.send('system:log', 'Processing sync..');
 
@@ -390,7 +360,7 @@ async function syncFolder(folder) {
           mainWindow.webContents.send('sync:updateStatus', {
             code: 200,
             message: 'Synced successfully',
-            fileName: file,
+            fileName: file, // absolute path
             status: 'Synced',
           });
         } else {
@@ -404,7 +374,6 @@ async function syncFolder(folder) {
       })
       .catch(function (error) {
         console.log('Error: ', error);
-
         mainWindow.webContents.send('sync:updateStatus', {
           code: 500,
           message: 'Error occured by API',
@@ -420,11 +389,9 @@ async function syncFolder(folder) {
       process.platform === PLATFORMS.WIN
     ) {
       const logFilePath = path.join(process.cwd(), 'log.txt');
-
       if (!fs.existsSync(logFilePath)) {
         fs.writeFileSync(logFilePath, '', { flag: 'w' });
       }
-
       fs.appendFileSync(logFilePath, `[${new Date().toLocaleString()}] (Queued) ${path.basename(file)}\n`);
     }
   });
@@ -438,10 +405,12 @@ ipcMain.on('app:getVersion', () => {
 });
 
 function wait(ms) {
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
     setTimeout(() => {
       console.log('Done waiting');
       resolve(ms);
     }, ms);
   });
 }
+
+module.exports = { gatherSyncFiles }; // exported for potential tests

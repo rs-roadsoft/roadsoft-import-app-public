@@ -38,7 +38,6 @@
     "electron-packager": "^15.5.1",
     "electron-reload": "^2.0.0-alpha.1",
     "electronmon": "^2.0.3",
-    "knip": "^5.66.4",
     "lint-staged": "^16.2.6",
     "prettier": "^3.6.2",
     "simple-git-hooks": "^2.13.1"
