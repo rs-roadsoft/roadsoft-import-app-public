@@ -9,11 +9,18 @@ It provides automatic sync scheduling, local configuration storage (SQLite), and
 
 - Authentication via **Company Identifier** and **API Key**
 - Syncs tachograph files (`.ddd`, `.esm`) to RoadSoft API
-- Supports automatic scheduled sync (every 1h / 12h / 24h / app start)
-- Local settings stored in **SQLite** database
-- Minimize to tray and auto-launch on system startup
-- Auto-updater and logging support
-- Environment-aware API (Staging / Production)
+- **Subfolder support:** scans the selected folder and **all nested subfolders** (up to 10 levels)
+- **Auto-unzip archives:** automatically extracts `.zip` files, including **nested zips**  
+  — on success the original archive is removed; on failure (e.g., password/corruption) the zip is moved to **Failed** folder
+  and any partial files/folders are cleaned up
+- **Smart post-sync handling:**  
+  — synced files at the root are moved to **Archived**;  
+  — if a file came from a subfolder, the **top-level subfolder** is archived as a whole;  
+  — failed items are moved to **Failed**
+- Supports automatic scheduled sync (every **1h / 12h / 24h** or **on app start**)
+- Local settings stored in **SQLite** database (Company ID, API key, folder, schedule)
+- Minimize to tray and **auto-launch** on system startup
+- Cross-platform: **Windows** and **macOS**
 
 ---
 
