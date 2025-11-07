@@ -1,7 +1,7 @@
 /* eslint-disable no-useless-escape */
 const electron = require('electron');
 const { ipcRenderer, shell } = electron;
-const { dialog } = require('@electron/remote');
+const { app, dialog } = require('@electron/remote');
 const fs = require('fs');
 const path = require('path');
 const extractZip = require('extract-zip');
@@ -31,6 +31,8 @@ ipcRenderer.on('dbConfig:setPreset', (e, data) => {
   $('#api-key').val(data.apiKey);
   $('#last-sync').text(data.lastSync);
   $('#folder-path').text(data.folderPath);
+  $('label[for="company-id"]').addClass('active');
+  $('label[for="api-key"]').addClass('active');
   // Select schedule option safely
   if (data.syncSchedule) {
     $(`#trigger option[value='${data.syncSchedule}']`).attr('selected', 'selected');
@@ -59,10 +61,12 @@ $('#connect').on('click', function () {
     addLog('Please fill company identifier and api key.');
     return;
   }
+
   if (!UUID_REGEX.test(companyId)) {
     addLog('Company Identifier format is invalid. Example: 123e4567-e89b-12d3-a456-426614174000');
     return;
   }
+
   ipcRenderer.send('config:authenticate', { companyId, apiKey });
 });
 
@@ -89,8 +93,10 @@ ipcRenderer.on('config:error', (e, error) => {
 // ============================= Folder choose =============================
 $('#select-folder').on('click', async function () {
   const pathDlg = await dialog.showOpenDialog({ properties: ['openDirectory'] });
+
   if (!pathDlg.canceled) {
     const folderPath = pathDlg.filePaths[0];
+
     $('#folder-path').text(folderPath);
     getFilesFromFolder(folderPath);
     ipcRenderer.send('dbConfig:setFolderPath', folderPath);
@@ -132,6 +138,7 @@ function isPathInside(rootDir, candidate) {
 function ensureSpecialFolders(rootPath) {
   const archivedDir = path.join(rootPath, DIRS.ARCHIVED);
   const failedDir = path.join(rootPath, DIRS.FAILED);
+
   if (!fs.existsSync(archivedDir)) {
     fs.mkdirSync(archivedDir);
   }
@@ -153,6 +160,7 @@ function hasRowFor(fullPath) {
       const rowData = filesDataTable.row(idx).data();
       return rowData && typeof rowData[0] === 'string' && rowData[0].includes(fullPath);
     });
+
   return indexes.length > 0;
 }
 
@@ -211,8 +219,6 @@ async function scanAndUnpack(rootPath, dirPath, depth) {
         // Rescan current directory (do not increase depth)
         await scanAndUnpack(rootPath, dirPath, depth);
       } catch (zipErr) {
-        addLog(`[Unzip Error] ${entry.name}: ${zipErr.message}`);
-
         // Cleanup any partially created items (STRICTLY within root)
         let afterNames = [];
         try {
@@ -256,9 +262,7 @@ async function scanAndUnpack(rootPath, dirPath, depth) {
         if (isPathInside(rootPath, failedTarget)) {
           try {
             fs.renameSync(full, failedTarget);
-          } catch (moveErr) {
-            addLog(`Error moving failed zip: ${moveErr.message}`);
-          }
+          } catch (moveErr) {}
         } else {
           addLog(`[Guard] Skip moving failed zip outside root: ${failedTarget}`);
         }
@@ -485,6 +489,7 @@ ipcRenderer.on('system:update-last-sync', function (event, data) {
 $('#folder-path').on('click', function (e) {
   e.preventDefault();
   const folder = $('#folder-path').text();
+
   if (folder) {
     shell.openPath(folder);
   }
@@ -492,8 +497,15 @@ $('#folder-path').on('click', function (e) {
 
 $('#open-log').on('click', function (e) {
   e.preventDefault();
+
+  const logFilePath = path.join(app.getPath('userData'), 'log.txt');
+
+  if (!fs.existsSync(logFilePath)) {
+    return;
+  }
+
   // Always open local log.txt in CWD as before
-  shell.openPath('log.txt');
+  shell.openPath(logFilePath);
 });
 
 /* =========================================================================
@@ -509,4 +521,50 @@ ipcRenderer.send('app:getVersion');
 
 ipcRenderer.on('app:setVersion', (e, version) => {
   $('title').text(`${$('title').text()} v${version}`);
+});
+
+/* =========================================================================
+   STARTUP PREFERENCES
+   ========================================================================= */
+
+// Add event listeners for checkboxes
+$('#auto-start-enabled').on('change', function () {
+  const enabled = $(this).is(':checked');
+  ipcRenderer.send('settings:setAutoStart', enabled);
+
+  // Control "Start minimized" availability based on "Auto-start"
+  if (enabled) {
+    // Enable "Start minimized" checkbox
+    $('#start-minimized').prop('disabled', false);
+    $('label[for="start-minimized"]').css('opacity', '1');
+  } else {
+    // Disable and uncheck "Start minimized" checkbox
+    $('#start-minimized').prop('disabled', true);
+    $('#start-minimized').prop('checked', false);
+    $('label[for="start-minimized"]').css('opacity', '0.5');
+    // Save to database
+    ipcRenderer.send('settings:setStartMinimized', false);
+  }
+});
+
+$('#start-minimized').on('change', function () {
+  const minimized = $(this).is(':checked');
+  ipcRenderer.send('settings:setStartMinimized', minimized);
+});
+
+// Load preferences on startup
+ipcRenderer.send('settings:getStartupPreferences');
+
+ipcRenderer.on('settings:setStartupPreferences', (e, data) => {
+  $('#auto-start-enabled').prop('checked', data.autoStartEnabled);
+  $('#start-minimized').prop('checked', data.startMinimized);
+
+  // Set "Start minimized" disabled state based on "Auto-start"
+  if (data.autoStartEnabled) {
+    $('#start-minimized').prop('disabled', false);
+    $('label[for="start-minimized"]').css('opacity', '1');
+  } else {
+    $('#start-minimized').prop('disabled', true);
+    $('label[for="start-minimized"]').css('opacity', '0.5');
+  }
 });
