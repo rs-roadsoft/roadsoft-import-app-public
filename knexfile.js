@@ -4,11 +4,9 @@
  * @type { Object.<string, import("knex").Knex.Config> }
  */
 module.exports = {
-  development: {
-    client: 'sqlite3',
-    connection: {
-      filename: './app/config.db',
-    },
-    useNullAsDefault: true,
+  client: 'sqlite3',
+  connection: {
+    filename: './app/config.db',
   },
+  useNullAsDefault: true,
 };

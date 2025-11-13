@@ -38,6 +38,16 @@ It provides automatic sync scheduling, local configuration storage (SQLite), and
 
 npm install
 
+### Setup local development database
+
+For local development, you need to create a local database file:
+
+```bash
+cp app/config.db app/config_local.db
+```
+
+This creates your personal development database that won't be tracked by git.
+
 ## Start in development mode
 
 npm run dev

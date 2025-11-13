@@ -30,13 +30,13 @@
         <div class="col-4">
           <div class="md-form mt-0">
             <input type="text" id="company-id" class="form-control" />
-            <label for="company-id">Company Identifier</label>
+            <label for="company-id" class="active">Company Identifier</label>
           </div>
         </div>
         <div class="col-5">
           <div class="md-form mt-0">
             <input type="text" id="api-key" class="form-control" />
-            <label for="api-key">API Key</label>
+            <label for="api-key" class="active">API Key</label>
           </div>
         </div>
         <div class="col-3">
@@ -84,11 +84,29 @@
           <a href="#" id="open-log" class="logs">Logs</a>
         </div>
         <div class="col-9 mb-4">
-          <div class="text-right mb-3" style="display: flex; justify-content: right">
-            <select name="" id="changeLanguage" class="form-control" style="width: 20% !important">
-              <option value="">Change Language</option>
-              <option value="en">English</option>
-            </select>
+          <div class="mb-3" style="display: flex; justify-content: space-between; align-items: flex-start">
+            <div class="form-group" style="margin: 0">
+              <h6>Startup Settings</h6>
+              <div class="form-check mt-2">
+                <input type="checkbox" class="form-check-input" id="auto-start-enabled" />
+                <label class="form-check-label" for="auto-start-enabled" style="cursor: pointer">
+                  Start application with system
+                </label>
+              </div>
+              <div class="form-check mt-2">
+                <input type="checkbox" class="form-check-input" id="start-minimized" />
+                <label class="form-check-label" for="start-minimized" style="cursor: pointer"> Start minimized </label>
+                <small class="form-text text-muted" style="margin-left: 24px; display: block; margin-top: 2px">
+                  Only available when auto-start is enabled
+                </small>
+              </div>
+            </div>
+            <div>
+              <select name="" id="changeLanguage" class="form-control" style="width: 200px">
+                <option value="">Change Language</option>
+                <option value="en">English</option>
+              </select>
+            </div>
           </div>
           <table id="dtBasicExample" class="table table-striped table-bordered mb-2" cellspacing="0" width="100%">
             <thead>

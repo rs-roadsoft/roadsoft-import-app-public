@@ -1,6 +1,6 @@
 // Modules to control application life and create native browser window
 const electron = require('electron');
-const { app, BrowserWindow, Tray, Menu } = electron;
+const { app, BrowserWindow, dialog, Tray, Menu, powerMonitor } = electron;
 const { ipcMain } = electron;
 require('@electron/remote/main').initialize();
 
@@ -26,7 +26,9 @@ let lastSync = '';
 let folderPath = '';
 let scheduleId;
 let tray = null;
-let isQuiting;
+let lastScheduleCheck = Date.now();
+let scheduleInterval = null; // in milliseconds
+let isWindowVisible = true;
 
 autoUpdater.autoDownload = false;
 autoUpdater.autoInstallOnAppQuit = true;
@@ -39,7 +41,7 @@ async function preset() {
   folderPath = await dbConfig.getSetting('folder_path');
 }
 
-function createWindow() {
+function createWindow(startMinimized = false) {
   // Create the browser window.
   mainWindow = new BrowserWindow({
     webPreferences: {
@@ -49,30 +51,64 @@ function createWindow() {
     },
     show: false,
   });
+
   require('@electron/remote/main').enable(mainWindow.webContents);
 
   mainWindow.loadFile(path.join(__dirname, 'frontend/index.html'));
-  mainWindow.maximize();
-  mainWindow.show();
+
+  if (startMinimized) {
+    // Don't show or maximize, just hide to tray
+    mainWindow.hide();
+    if (tray) {
+      tray.displayBalloon({
+        title: 'RoadSoft',
+        content: 'Application started in system tray',
+      });
+    }
+  } else {
+    mainWindow.maximize();
+    mainWindow.show();
+  }
 
   preset();
 
   mainWindow.on('minimize', (event) => {
     event.preventDefault();
     mainWindow.hide();
-    if (tray) {
-      tray.displayBalloon({
-        title: 'RoadSoft',
-        content: 'The app has been minimized to the system tray',
-      });
+    if (tray && process.platform === PLATFORMS.WIN) {
+      tray.displayBalloon({ title: 'RoadSoft', content: 'The app has been minimized to the system tray' });
     }
   });
 
-  // Intercept close to keep running in tray unless user explicitly quits
+  // Handle window visibility changes for Windows sync fix
+  mainWindow.on('hide', () => {
+    isWindowVisible = false;
+    log.info('Window hidden - sync continues in background');
+  });
+
+  mainWindow.on('show', () => {
+    isWindowVisible = true;
+    log.info('Window shown - sync continues normally');
+  });
+
   mainWindow.on('close', (event) => {
-    if (!isQuiting) {
-      event.preventDefault();
-      mainWindow.hide();
+    event.preventDefault();
+
+    const choice = dialog.showMessageBoxSync(mainWindow, {
+      type: 'question',
+      buttons: ['Exit', 'Cancel'],
+      defaultId: 0,
+      cancelId: 1,
+      title: 'Confirm exit',
+      message: 'Would you like to exit the app?',
+    });
+
+    if (choice === 0) {
+      // Clean up timers before exit
+      if (scheduleId) {
+        clearInterval(scheduleId);
+      }
+      app.exit(0);
     }
   });
 }
@@ -91,7 +127,6 @@ function createTray() {
     {
       label: 'Quit',
       click: function () {
-        isQuiting = true;
         app.quit();
       },
     },
@@ -103,28 +138,101 @@ function createTray() {
   });
 }
 
-app.whenReady().then(() => {
-  createWindow();
+app.whenReady().then(async () => {
+  Menu.setApplicationMenu(null);
+
+  // Load auto-start preferences from DB
+  const autoStartEnabled = await dbConfig.getSetting('auto_start_enabled');
+  const startMinimized = await dbConfig.getSetting('start_minimized');
+
+  // Auto-launch only works in production (packaged app)
+  if (app.isPackaged) {
+    const autoLaunch = new AutoLaunch({
+      name: 'roadsoft',
+      path: app.getPath('exe'),
+    });
+
+    // Only enable/disable based on user preference
+    try {
+      if (autoStartEnabled === 'true') {
+        await autoLaunch.enable();
+      } else if (autoStartEnabled === 'false') {
+        await autoLaunch.disable();
+      }
+      // If null/undefined, do nothing (first run - let user decide)
+    } catch (err) {
+      log.error('Auto-launch error:', err.message);
+    }
+  } else {
+    log.info('Auto-launch disabled in development mode');
+  }
+
+  createWindow(startMinimized === 'true');
   createTray();
 
   app.on('activate', function () {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
 
-  app.on('before-quit', function () {
-    isQuiting = true;
-  });
-
   // trigger auto updater on startup
   autoUpdater.checkForUpdatesAndNotify();
 
-  // auto-launch on login
-  const autoLaunch = new AutoLaunch({
-    name: 'roadsoft',
-    path: app.getPath('exe'),
+  // Handle system resume from sleep/suspend
+  powerMonitor.on('resume', () => {
+    log.info('System resumed from sleep');
+
+    // Check if we missed a scheduled sync
+    const timeSinceLastCheck = Date.now() - lastScheduleCheck;
+
+    if (scheduleId && scheduleInterval && timeSinceLastCheck >= scheduleInterval) {
+      log.info('Missed sync during sleep, triggering now');
+      mainWindow.webContents.send('system:log', 'System resumed - checking for missed sync...');
+
+      // Validate folder path before syncing
+      if (folderPath && fs.existsSync(folderPath)) {
+        syncFolder(folderPath);
+      }
+
+      lastScheduleCheck = Date.now();
+    } else if (scheduleId && scheduleInterval) {
+      // System woke up BEFORE the scheduled time
+      // setInterval may be unreliable after sleep, so restart it
+      log.info('Restarting scheduler after sleep to ensure reliability');
+
+      // Calculate remaining time until next sync
+      const remainingTime = scheduleInterval - timeSinceLastCheck;
+
+      // Clear old interval
+      clearInterval(scheduleId);
+
+      // Set new interval with remaining time for first run, then normal interval
+      scheduleId = setTimeout(() => {
+        lastScheduleCheck = Date.now();
+        if (folderPath && fs.existsSync(folderPath)) {
+          syncFolder(folderPath);
+        }
+
+        // After first sync, switch to regular interval
+        scheduleId = setInterval(() => {
+          lastScheduleCheck = Date.now();
+          if (folderPath && fs.existsSync(folderPath)) {
+            syncFolder(folderPath);
+          } else {
+            mainWindow.webContents.send('system:log', 'Error: Folder path is invalid or no longer exists');
+          }
+        }, scheduleInterval);
+      }, remainingTime);
+
+      mainWindow.webContents.send(
+        'system:log',
+        `Scheduler restarted, next sync in ${Math.round(remainingTime / 60000)} minutes`,
+      );
+    }
   });
-  autoLaunch.isEnabled().then((isEnabled) => {
-    if (!isEnabled) autoLaunch.enable();
+
+  // Optional: log when system is about to sleep
+  powerMonitor.on('suspend', () => {
+    log.info('System is going to sleep');
   });
 });
 
@@ -204,6 +312,7 @@ function gatherSyncFiles(rootDir, currentDir = rootDir, depth = 0, maxDepth = MA
 //pre sets
 ipcMain.on('dbConfig:getPreset', async () => {
   const syncSchedule = await dbConfig.getSetting('sync_schedule');
+
   mainWindow.webContents.send('dbConfig:setPreset', {
     companyId,
     apiKey,
@@ -233,6 +342,7 @@ ipcMain.on('sync:previousSchedule', async () => {
     mainWindow.webContents.send('system:log', 'Sync scheduled: ' + scheduleTrigger);
 
     const connection = await connect(companyId, apiKey);
+
     if (connection) {
       if (scheduleTrigger == 'application_start') {
         if (scheduleId) {
@@ -267,6 +377,7 @@ async function connect(company_id, api_key) {
 
   try {
     const response = await axios(config);
+
     if (response) {
       apiKey = api_key;
       companyId = company_id;
@@ -274,11 +385,13 @@ async function connect(company_id, api_key) {
       dbConfig.setSetting('company_id', companyId);
       dbConfig.refreshLastSync();
       mainWindow.webContents.send('config:success');
+
       return true;
     }
   } catch (error) {
     console.log(error.message);
     mainWindow.webContents.send('config:error', error?.response?.data?.message || 'Cannot connect');
+
     return false;
   }
 }
@@ -314,7 +427,25 @@ function scheduleSyncOnHour(hour) {
       clearInterval(scheduleId);
     } catch (error) {}
   }
-  scheduleId = setInterval(() => syncFolder(folderPath), 1000 * 60 * 60 * hour);
+
+  scheduleInterval = hour * 60 * 60 * 1000;
+  lastScheduleCheck = Date.now();
+
+  scheduleId = setInterval(() => {
+    lastScheduleCheck = Date.now();
+
+    // Check if folder path is still valid
+    if (folderPath && fs.existsSync(folderPath)) {
+      syncFolder(folderPath);
+
+      // On Windows, log when sync happens while window is hidden
+      if (process.platform === PLATFORMS.WIN && !isWindowVisible) {
+        log.info('Sync completed while window hidden');
+      }
+    } else {
+      mainWindow.webContents.send('system:log', 'Error: Folder path is invalid or no longer exists');
+    }
+  }, scheduleInterval);
 }
 
 ipcMain.on('sync:start', async () => {
@@ -326,6 +457,12 @@ ipcMain.on('sync:start', async () => {
 async function syncFolder(folder) {
   if (!folder) {
     mainWindow.webContents.send('system:log', 'No folder selected for sync.');
+    return;
+  }
+
+  // Check if folder exists
+  if (!fs.existsSync(folder)) {
+    mainWindow.webContents.send('system:log', `Error: Selected folder does not exist: ${folder}`);
     return;
   }
 
@@ -360,7 +497,7 @@ async function syncFolder(folder) {
           mainWindow.webContents.send('sync:updateStatus', {
             code: 200,
             message: 'Synced successfully',
-            fileName: file, // absolute path
+            fileName: file,
             status: 'Synced',
           });
         } else {
@@ -382,18 +519,13 @@ async function syncFolder(folder) {
         });
       });
 
-    // TODO Temporary fix for macOS build. Logs either MacOS on develop or Win.
-    // Kept same logic, but now uses "file" from recursion as well.
-    if (
-      (process.env.NODE_ENV === 'develop' && process.platform === PLATFORMS.MAC) ||
-      process.platform === PLATFORMS.WIN
-    ) {
-      const logFilePath = path.join(process.cwd(), 'log.txt');
-      if (!fs.existsSync(logFilePath)) {
-        fs.writeFileSync(logFilePath, '', { flag: 'w' });
-      }
-      fs.appendFileSync(logFilePath, `[${new Date().toLocaleString()}] (Queued) ${path.basename(file)}\n`);
+    const logFilePath = path.join(app.getPath('userData'), 'log.txt');
+
+    if (!fs.existsSync(logFilePath)) {
+      fs.writeFileSync(logFilePath, '', { flag: 'w' });
     }
+
+    fs.appendFileSync(logFilePath, `[${new Date().toLocaleString()}] (Success) ${path.basename(file)}\n`);
   });
 
   // tell renderer to update "last sync" timestamp in UI
@@ -402,6 +534,58 @@ async function syncFolder(folder) {
 
 ipcMain.on('app:getVersion', () => {
   mainWindow.webContents.send('app:setVersion', app.getVersion());
+});
+
+/* ===================================== Startup Settings IPC ===================================== */
+
+ipcMain.on('settings:setAutoStart', async (e, enabled) => {
+  await dbConfig.setSetting('auto_start_enabled', enabled ? 'true' : 'false');
+
+  // If auto-start is disabled, also disable start minimized
+  if (!enabled) {
+    await dbConfig.setSetting('start_minimized', 'false');
+  }
+
+  // Auto-launch only works in production (packaged app)
+  if (app.isPackaged) {
+    const autoLaunch = new AutoLaunch({
+      name: 'roadsoft',
+      path: app.getPath('exe'),
+    });
+
+    try {
+      if (enabled) {
+        await autoLaunch.enable();
+      } else {
+        await autoLaunch.disable();
+      }
+      mainWindow.webContents.send('system:log', `Auto-start ${enabled ? 'enabled' : 'disabled'}`);
+    } catch (err) {
+      log.error('Auto-launch error:', err.message);
+      mainWindow.webContents.send('system:log', `Auto-start error: ${err.message}`);
+    }
+  } else {
+    mainWindow.webContents.send(
+      'system:log',
+      `Auto-start ${enabled ? 'enabled' : 'disabled'} (dev mode - will work in production)`,
+    );
+  }
+});
+
+ipcMain.on('settings:setStartMinimized', async (e, minimized) => {
+  await dbConfig.setSetting('start_minimized', minimized ? 'true' : 'false');
+  mainWindow.webContents.send('system:log', `Start minimized ${minimized ? 'enabled' : 'disabled'}`);
+});
+
+// Add handler to get current settings
+ipcMain.on('settings:getStartupPreferences', async () => {
+  const autoStartEnabled = await dbConfig.getSetting('auto_start_enabled');
+  const startMinimized = await dbConfig.getSetting('start_minimized');
+
+  mainWindow.webContents.send('settings:setStartupPreferences', {
+    autoStartEnabled: autoStartEnabled === 'true',
+    startMinimized: startMinimized === 'true',
+  });
 });
 
 function wait(ms) {

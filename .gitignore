@@ -3,3 +3,4 @@
 /roadsoft-darwin-arm64
 .DS_Store
 log.txt
+app/config_local.db
