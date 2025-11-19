@@ -49,6 +49,7 @@ function createWindow(startMinimized = false) {
       enableRemoteModule: true,
       contextIsolation: false,
     },
+    icon: path.join(__dirname, 'frontend/images/app-512.png'),
     show: false,
   });
 
@@ -171,7 +172,13 @@ app.whenReady().then(async () => {
   createTray();
 
   app.on('activate', function () {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+    // On macOS, clicking the dock icon should show the window
+    if (BrowserWindow.getAllWindows().length === 0) {
+      createWindow();
+    } else {
+      mainWindow.show();
+      mainWindow.maximize();
+    }
   });
 
   // trigger auto updater on startup
