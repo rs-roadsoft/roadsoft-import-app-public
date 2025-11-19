@@ -13,6 +13,15 @@ const AutoLaunch = require('auto-launch');
 
 const dbConfig = require('./models/settings');
 const setting = require('./setting');
+const packageJson = require('./package.json');
+
+function getCustomHeaders() {
+  return {
+    'Client-Type': 'roadsoft-uploader',
+    'App-Version': packageJson.version,
+    Platform: process.platform,
+  };
+}
 
 const MAX_SCAN_DEPTH = 10;
 const DIRS = Object.freeze({ ARCHIVED: 'Archived', FAILED: 'Failed' });
@@ -379,7 +388,10 @@ async function connect(company_id, api_key) {
   const config = {
     method: 'get',
     url: `${setting.baseUrl}/api/v2/tachofile/import/company/${company_id}/verify`,
-    headers: { 'API-KEY': api_key },
+    headers: {
+      'API-KEY': api_key,
+      ...getCustomHeaders(),
+    },
   };
 
   try {
@@ -494,7 +506,11 @@ async function syncFolder(folder) {
     const config = {
       method: 'post',
       url: `${setting.baseUrl}/api/v2/tachofile/import/company/${companyId}`,
-      headers: { 'API-KEY': apiKey, 'Content-Type': 'application/json' },
+      headers: {
+        'API-KEY': apiKey,
+        'Content-Type': 'application/json',
+        ...getCustomHeaders(),
+      },
       data,
     };
 
