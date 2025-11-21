@@ -473,6 +473,22 @@ ipcMain.on('sync:start', async () => {
 });
 
 /* ===================================== SYNC LOGIC (updated) ===================================== */
+function generateSyncSummary(stats) {
+  let message = '';
+
+  if (stats.success > 0) {
+    message += `Successfully synced: ${stats.success}`;
+  }
+
+  if (stats.failed > 0) {
+    if (message) message += ' | ';
+    message += `Failed: ${stats.failed}`;
+  }
+
+  message += ' files';
+  return message;
+}
+
 async function syncFolder(folder) {
   if (!folder) {
     mainWindow.webContents.send('system:log', 'No folder selected for sync.');
@@ -494,6 +510,15 @@ async function syncFolder(folder) {
 
   // collect all .ddd / .esm from root + subfolders (depth up to 10)
   const filesToSync = gatherSyncFiles(folder);
+
+  // If no files to sync, log and return
+  if (filesToSync.length === 0) {
+    mainWindow.webContents.send('system:log', 'No files to sync');
+    return;
+  }
+
+  // Track completion of all file uploads
+  const syncStats = { total: 0, success: 0, failed: 0 };
 
   // upload each file to the API using axios.then() so renderer can update per-file status
   filesToSync.forEach((file) => {
@@ -517,6 +542,7 @@ async function syncFolder(folder) {
     axios(config)
       .then(function (response) {
         if (response.data.jobId) {
+          syncStats.success++;
           mainWindow.webContents.send('sync:updateStatus', {
             code: 200,
             message: 'Synced successfully',
@@ -524,6 +550,7 @@ async function syncFolder(folder) {
             status: 'Synced',
           });
         } else {
+          syncStats.failed++;
           mainWindow.webContents.send('sync:updateStatus', {
             code: response.status,
             message: 'Error occured by API',
@@ -534,12 +561,23 @@ async function syncFolder(folder) {
       })
       .catch(function (error) {
         console.log('Error: ', error);
+        syncStats.failed++;
         mainWindow.webContents.send('sync:updateStatus', {
           code: 500,
           message: 'Error occured by API',
           fileName: file,
           status: 'Not Synced',
         });
+      })
+      .finally(function () {
+        // Increment total counter
+        syncStats.total++;
+
+        // When all files are processed, log summary message
+        if (syncStats.total === filesToSync.length) {
+          const summaryMessage = generateSyncSummary(syncStats);
+          mainWindow.webContents.send('system:log', summaryMessage);
+        }
       });
 
     const logFilePath = path.join(app.getPath('userData'), 'log.txt');
