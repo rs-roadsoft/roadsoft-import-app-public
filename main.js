@@ -13,6 +13,15 @@ const AutoLaunch = require('auto-launch');
 
 const dbConfig = require('./models/settings');
 const setting = require('./setting');
+const packageJson = require('./package.json');
+
+function getCustomHeaders() {
+  return {
+    'Client-Type': 'roadsoft-uploader',
+    'App-Version': packageJson.version,
+    Platform: process.platform,
+  };
+}
 
 const MAX_SCAN_DEPTH = 10;
 const DIRS = Object.freeze({ ARCHIVED: 'Archived', FAILED: 'Failed' });
@@ -379,7 +388,10 @@ async function connect(company_id, api_key) {
   const config = {
     method: 'get',
     url: `${setting.baseUrl}/api/v2/tachofile/import/company/${company_id}/verify`,
-    headers: { 'API-KEY': api_key },
+    headers: {
+      'API-KEY': api_key,
+      ...getCustomHeaders(),
+    },
   };
 
   try {
@@ -461,6 +473,22 @@ ipcMain.on('sync:start', async () => {
 });
 
 /* ===================================== SYNC LOGIC (updated) ===================================== */
+function generateSyncSummary(stats) {
+  let message = '';
+
+  if (stats.success > 0) {
+    message += `Successfully synced: ${stats.success}`;
+  }
+
+  if (stats.failed > 0) {
+    if (message) message += ' | ';
+    message += `Failed: ${stats.failed}`;
+  }
+
+  message += ' files';
+  return message;
+}
+
 async function syncFolder(folder) {
   if (!folder) {
     mainWindow.webContents.send('system:log', 'No folder selected for sync.');
@@ -483,6 +511,15 @@ async function syncFolder(folder) {
   // collect all .ddd / .esm from root + subfolders (depth up to 10)
   const filesToSync = gatherSyncFiles(folder);
 
+  // If no files to sync, log and return
+  if (filesToSync.length === 0) {
+    mainWindow.webContents.send('system:log', 'No files to sync');
+    return;
+  }
+
+  // Track completion of all file uploads
+  const syncStats = { total: 0, success: 0, failed: 0 };
+
   // upload each file to the API using axios.then() so renderer can update per-file status
   filesToSync.forEach((file) => {
     const data = JSON.stringify({
@@ -494,13 +531,18 @@ async function syncFolder(folder) {
     const config = {
       method: 'post',
       url: `${setting.baseUrl}/api/v2/tachofile/import/company/${companyId}`,
-      headers: { 'API-KEY': apiKey, 'Content-Type': 'application/json' },
+      headers: {
+        'API-KEY': apiKey,
+        'Content-Type': 'application/json',
+        ...getCustomHeaders(),
+      },
       data,
     };
 
     axios(config)
       .then(function (response) {
         if (response.data.jobId) {
+          syncStats.success++;
           mainWindow.webContents.send('sync:updateStatus', {
             code: 200,
             message: 'Synced successfully',
@@ -508,6 +550,7 @@ async function syncFolder(folder) {
             status: 'Synced',
           });
         } else {
+          syncStats.failed++;
           mainWindow.webContents.send('sync:updateStatus', {
             code: response.status,
             message: 'Error occured by API',
@@ -518,12 +561,23 @@ async function syncFolder(folder) {
       })
       .catch(function (error) {
         console.log('Error: ', error);
+        syncStats.failed++;
         mainWindow.webContents.send('sync:updateStatus', {
           code: 500,
           message: 'Error occured by API',
           fileName: file,
           status: 'Not Synced',
         });
+      })
+      .finally(function () {
+        // Increment total counter
+        syncStats.total++;
+
+        // When all files are processed, log summary message
+        if (syncStats.total === filesToSync.length) {
+          const summaryMessage = generateSyncSummary(syncStats);
+          mainWindow.webContents.send('system:log', summaryMessage);
+        }
       });
 
     const logFilePath = path.join(app.getPath('userData'), 'log.txt');
