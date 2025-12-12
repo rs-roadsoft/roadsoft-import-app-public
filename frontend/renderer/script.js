@@ -1,18 +1,25 @@
 /* eslint-disable no-useless-escape */
 const electron = require('electron');
-const { ipcRenderer, shell } = electron;
+const { ipcRenderer } = electron;
 const { app, dialog } = require('@electron/remote');
 const fs = require('fs');
 const path = require('path');
 const extractZip = require('extract-zip');
+const trash = require('trash');
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const MAX_SCAN_DEPTH = 10;
 
 const DIRS = Object.freeze({ ARCHIVED: 'Archived', FAILED: 'Failed' });
 const EXT = Object.freeze({ ZIP: '.zip', DDD: '.ddd', ESM: '.esm' });
+const BATCH_SIZE = 100;
 
 let connected = false;
+
+// Performance optimization: Set for O(1) lookup instead of O(n) DataTable search
+const addedFilePaths = new Set();
+// Batching: accumulate rows and flush every BATCH_SIZE
+let pendingRows = [];
 
 // DataTable init
 const filesDataTable = $('#dtBasicExample').DataTable({
@@ -153,15 +160,7 @@ function escapeHtml(str) {
 
 /** Check if a row for the given absolute path already exists in the table. */
 function hasRowFor(fullPath) {
-  const indexes = filesDataTable
-    .rows()
-    .indexes()
-    .filter((idx) => {
-      const rowData = filesDataTable.row(idx).data();
-      return rowData && typeof rowData[0] === 'string' && rowData[0].includes(fullPath);
-    });
-
-  return indexes.length > 0;
+  return addedFilePaths.has(fullPath);
 }
 
 /**
@@ -213,13 +212,13 @@ async function scanAndUnpack(rootPath, dirPath, depth) {
       try {
         // Extract into current directory
         await extractZip(full, { dir: dirPath });
-        // Remove original archive
-        fs.unlinkSync(full);
-        addLog(`[Unzip] Extracted ${entry.name}`);
+        // Move original archive to trash (recoverable)
+        await trash(full);
+        addLog(`[Unzip] Extracted ${entry.name}, original moved to trash`);
         // Rescan current directory (do not increase depth)
         await scanAndUnpack(rootPath, dirPath, depth);
       } catch (zipErr) {
-        // Cleanup any partially created items (STRICTLY within root)
+        // Cleanup any partially created items (STRICTLY within root) - move to trash
         let afterNames = [];
         try {
           afterNames = fs.readdirSync(dirPath);
@@ -229,27 +228,22 @@ async function scanAndUnpack(rootPath, dirPath, depth) {
 
         const newlyCreated = afterNames.filter((name) => !beforeNames.has(name));
 
-        const rmRecursiveSafe = (targetPath) => {
+        // Move partially created items to trash instead of permanent deletion
+        for (const name of newlyCreated) {
+          const targetPath = path.join(dirPath, name);
           // Guard: only remove within the chosen root
           if (!isPathInside(rootPath, targetPath) && realResolve(targetPath) !== realResolve(rootPath)) {
             addLog(`[Guard] Skip cleanup outside root: ${targetPath}`);
-            return;
+            continue;
           }
-          if (!fs.existsSync(targetPath)) return;
+          if (!fs.existsSync(targetPath)) continue;
           try {
-            const stat = fs.lstatSync(targetPath);
-            if (stat.isDirectory()) {
-              fs.readdirSync(targetPath).forEach((child) => rmRecursiveSafe(path.join(targetPath, child)));
-              fs.rmdirSync(targetPath);
-            } else {
-              fs.unlinkSync(targetPath);
-            }
+            await trash(targetPath);
+            addLog(`[Trash] Moved partial file to trash: ${targetPath}`);
           } catch (cleanupErr) {
             addLog(`Cleanup error for ${targetPath}: ${cleanupErr.message}`);
           }
-        };
-
-        newlyCreated.forEach((name) => rmRecursiveSafe(path.join(dirPath, name)));
+        }
 
         // Move bad zip to /Failed (guarded)
         const failedDir = path.join(rootPath, DIRS.FAILED);
@@ -281,26 +275,51 @@ async function getFilesFromFolder(folderPath) {
   // Rebuild table (fresh list of files)
   filesDataTable.clear().draw();
 
+  // Clear tracking Set and pending batch for fresh scan
+  addedFilePaths.clear();
+  pendingRows = [];
+
   const root = realResolve(folderPath);
   ensureSpecialFolders(root);
 
   // Incremental walk: rows are added on the fly (no collectors)
   await scanAndUnpack(root, root, 0);
+
+  // Flush any remaining rows after scan completes
+  flushPendingRows();
 }
 
 function addNewFile(fullPath, relativeDisplay) {
-  filesDataTable.row
-    .add([
-      // Hidden cell with absolute path for easy lookup
-      `<span style="display:none" class="file-fullpath" data-path="${escapeHtml(
-        fullPath,
-      )}">${escapeHtml(fullPath)}</span>`,
-      // Visible name
-      `<i class="fa fa-file-text"></i>&nbsp;&nbsp; ${escapeHtml(relativeDisplay)}`,
-      // Status
-      'Not Synced',
-    ])
-    .draw(false);
+  // Add to Set for O(1) lookup
+  addedFilePaths.add(fullPath);
+
+  // Accumulate row data for batching
+  pendingRows.push([
+    // Hidden cell with absolute path for easy lookup
+    `<span style="display:none" class="file-fullpath" data-path="${escapeHtml(
+      fullPath,
+    )}">${escapeHtml(fullPath)}</span>`,
+    // Visible name
+    `<i class="fa fa-file-text"></i>&nbsp;&nbsp; ${escapeHtml(relativeDisplay)}`,
+    // Status
+    'Not Synced',
+  ]);
+
+  // Flush batch when reaching BATCH_SIZE
+  if (pendingRows.length >= BATCH_SIZE) {
+    flushPendingRows();
+  }
+}
+
+/**
+ * Flush accumulated rows to DataTable in one batch.
+ * This reduces DOM operations from N to N/BATCH_SIZE.
+ */
+function flushPendingRows() {
+  if (pendingRows.length === 0) return;
+  pendingRows.forEach((row) => filesDataTable.row.add(row));
+  filesDataTable.draw(false);
+  pendingRows = [];
 }
 
 /* =========================================================================
@@ -354,7 +373,9 @@ function changeStatusToProcessing() {
 
 /**
  * Safe remove helper (overwrite support, ROOT-GUARDED).
- * Removes a file or directory recursively if it exists, but only if it's inside `rootGuard`.
+ * Moves a file or directory to trash if it exists, but only if it's inside `rootGuard`.
+ * Uses trash package for cross-platform support (works with folders on Windows).
+ * Note: This is async but called in fire-and-forget manner for compatibility with existing code.
  */
 function removePathRecursiveSyncSafe(targetPath, rootGuard) {
   // Guard: never allow deletions outside selected root
@@ -364,20 +385,13 @@ function removePathRecursiveSyncSafe(targetPath, rootGuard) {
   }
   if (!fs.existsSync(targetPath)) return;
 
-  try {
-    const stat = fs.lstatSync(targetPath);
-    if (stat.isDirectory()) {
-      // Remove contents first
-      fs.readdirSync(targetPath).forEach((name) => {
-        removePathRecursiveSyncSafe(path.join(targetPath, name), rootGuard);
-      });
-      fs.rmdirSync(targetPath);
-    } else {
-      fs.unlinkSync(targetPath);
-    }
-  } catch (err) {
-    addLog(`Remove error for ${targetPath}: ${err.message}`);
-  }
+  trash(targetPath)
+    .then(() => {
+      addLog(`[Trash] Moved to trash: ${targetPath}`);
+    })
+    .catch((err) => {
+      addLog(`Trash error for ${targetPath}: ${err.message}`);
+    });
 }
 
 /**

@@ -350,16 +350,18 @@ ipcMain.on('dbConfig:setFolderPath', async (e, newFolderPath) => {
   }
 });
 
-// previous schedule
+// previous schedule - also handles auto-reconnect on startup
 ipcMain.on('sync:previousSchedule', async () => {
   const scheduleTrigger = await dbConfig.getSetting('sync_schedule');
 
-  if (scheduleTrigger && folderPath) {
-    mainWindow.webContents.send('system:log', 'Sync scheduled: ' + scheduleTrigger);
-
+  // Always try to reconnect if we have credentials (fixes "not connected" on restart)
+  if (companyId && apiKey) {
     const connection = await connect(companyId, apiKey);
 
-    if (connection) {
+    // Only restore schedule if connection succeeded and we have a folder
+    if (connection && folderPath && scheduleTrigger) {
+      mainWindow.webContents.send('system:log', 'Sync scheduled: ' + scheduleTrigger);
+
       if (scheduleTrigger == 'application_start') {
         if (scheduleId) {
           try {

@@ -1,6 +1,6 @@
 {
   "name": "roadsoft",
-  "version": "2.1.7",
+  "version": "2.1.8",
   "description": "Project to sync file to roadsoft server",
   "main": "main.js",
   "scripts": {
@@ -50,7 +50,8 @@
     "electron-updater": "^5.3.0",
     "extract-zip": "^2.0.1",
     "knex": "^2.2.0",
-    "sqlite3": "5.0.11"
+    "sqlite3": "5.0.11",
+    "trash": "^7.2.0"
   },
   "build": {
     "productName": "RoadSoft",
