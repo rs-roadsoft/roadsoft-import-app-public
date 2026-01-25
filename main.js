@@ -28,6 +28,23 @@ const DIRS = Object.freeze({ ARCHIVED: 'Archived', FAILED: 'Failed' });
 const EXT = Object.freeze({ DDD: '.ddd', ESM: '.esm' });
 const PLATFORMS = Object.freeze({ MAC: 'darwin', WIN: 'win32' });
 
+// Bulk API constants
+const BULK_BATCH_SIZE = 100;
+const BULK_RETRY_DELAY_MS = 30000; // 30 seconds
+const BULK_MAX_RETRIES = 20;
+
+function chunk(array, size) {
+  const result = [];
+  for (let i = 0; i < array.length; i += size) {
+    result.push(array.slice(i, i + size));
+  }
+  return result;
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 let mainWindow;
 let companyId = '';
 let apiKey = '';
@@ -475,6 +492,17 @@ ipcMain.on('sync:start', async () => {
 });
 
 /* ===================================== SYNC LOGIC (updated) ===================================== */
+function logFileResult(file, success, errorMessage = '') {
+  const logFilePath = path.join(app.getPath('userData'), 'log.txt');
+
+  if (!fs.existsSync(logFilePath)) {
+    fs.writeFileSync(logFilePath, '', { flag: 'w' });
+  }
+
+  const status = success ? 'Success' : `Failed: ${errorMessage}`;
+  fs.appendFileSync(logFilePath, `[${new Date().toLocaleString()}] (${status}) ${path.basename(file)}\n`);
+}
+
 function generateSyncSummary(stats) {
   let message = '';
 
@@ -522,74 +550,99 @@ async function syncFolder(folder) {
   // Track completion of all file uploads
   const syncStats = { total: 0, success: 0, failed: 0 };
 
-  // upload each file to the API using axios.then() so renderer can update per-file status
-  filesToSync.forEach((file) => {
-    const data = JSON.stringify({
+  // Split files into batches for bulk API
+  const batches = chunk(filesToSync, BULK_BATCH_SIZE);
+
+  for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
+    const batch = batches[batchIndex];
+
+    // Prepare batch data
+    const filesData = batch.map((file) => ({
       fileName: path.basename(file),
       downloadDate: new Date().toISOString().split('.')[0],
       fileBytes: fs.readFileSync(file, { encoding: 'base64' }),
-    });
+    }));
 
-    const config = {
-      method: 'post',
-      url: `${setting.baseUrl}/api/v2/tachofile/import/company/${companyId}`,
-      headers: {
-        'API-KEY': apiKey,
-        'Content-Type': 'application/json',
-        ...getCustomHeaders(),
-      },
-      data,
-    };
+    // Send with retry on queue overflow
+    let retries = 0;
+    let success = false;
 
-    axios(config)
-      .then(function (response) {
+    while (!success && retries < BULK_MAX_RETRIES) {
+      try {
+        const response = await axios({
+          method: 'post',
+          url: `${setting.baseUrl}/api/v2/tachofile/import/company/${companyId}/bulk`,
+          headers: {
+            'API-KEY': apiKey,
+            'Content-Type': 'application/json',
+            ...getCustomHeaders(),
+          },
+          data: { files: filesData },
+        });
+
         if (response.data.jobId) {
-          syncStats.success++;
-          mainWindow.webContents.send('sync:updateStatus', {
-            code: 200,
-            message: 'Synced successfully',
-            fileName: file,
-            status: 'Synced',
-          });
-        } else {
-          syncStats.failed++;
-          mainWindow.webContents.send('sync:updateStatus', {
-            code: response.status,
-            message: 'Error occured by API',
-            fileName: file,
-            status: 'Not Synced',
+          // Success — update status for all files in batch
+          syncStats.success += batch.length;
+          batch.forEach((file) => {
+            mainWindow.webContents.send('sync:updateStatus', {
+              code: 200,
+              message: 'Synced successfully',
+              fileName: file,
+              status: 'Synced',
+            });
+            logFileResult(file, true);
           });
         }
-      })
-      .catch(function (error) {
-        console.log('Error: ', error);
-        syncStats.failed++;
+        success = true;
+      } catch (error) {
+        const codeName = error.response?.data?.codeName;
+
+        if (codeName === 'FILE_UPLOAD_TOO_MANY_FILES_IN_QUEUE') {
+          retries++;
+          mainWindow.webContents.send(
+            'system:log',
+            `Queue full, waiting ${BULK_RETRY_DELAY_MS / 1000}s... (${retries}/${BULK_MAX_RETRIES})`,
+          );
+          await delay(BULK_RETRY_DELAY_MS);
+        } else {
+          // Other error — mark entire batch as failed
+          console.log('Error: ', error);
+          syncStats.failed += batch.length;
+          batch.forEach((file) => {
+            mainWindow.webContents.send('sync:updateStatus', {
+              code: error.response?.status || 500,
+              message: error.message || 'Error occurred by API',
+              fileName: file,
+              status: 'Not Synced',
+            });
+            logFileResult(file, false, error.message);
+          });
+          success = true; // Exit retry loop
+        }
+      }
+    }
+
+    // Max retries exceeded — mark as failed
+    if (!success) {
+      syncStats.failed += batch.length;
+      batch.forEach((file) => {
         mainWindow.webContents.send('sync:updateStatus', {
-          code: 500,
-          message: 'Error occured by API',
+          code: 503,
+          message: 'Max retries exceeded',
           fileName: file,
           status: 'Not Synced',
         });
-      })
-      .finally(function () {
-        // Increment total counter
-        syncStats.total++;
-
-        // When all files are processed, log summary message
-        if (syncStats.total === filesToSync.length) {
-          const summaryMessage = generateSyncSummary(syncStats);
-          mainWindow.webContents.send('system:log', summaryMessage);
-        }
+        logFileResult(file, false, 'Max retries exceeded');
       });
-
-    const logFilePath = path.join(app.getPath('userData'), 'log.txt');
-
-    if (!fs.existsSync(logFilePath)) {
-      fs.writeFileSync(logFilePath, '', { flag: 'w' });
     }
 
-    fs.appendFileSync(logFilePath, `[${new Date().toLocaleString()}] (Success) ${path.basename(file)}\n`);
-  });
+    syncStats.total += batch.length;
+    mainWindow.webContents.send('system:log', `Batch ${batchIndex + 1}/${batches.length} complete`);
+  }
+
+  // Final summary message
+  const summaryMessage = generateSyncSummary(syncStats);
+  mainWindow.webContents.send('system:log', summaryMessage);
 
   // tell renderer to update "last sync" timestamp in UI
   mainWindow.webContents.send('system:update-last-sync', new Date().toLocaleString());
