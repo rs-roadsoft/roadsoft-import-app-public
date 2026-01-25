@@ -22,7 +22,7 @@ let languagePack = {
 }
 
 function changeLanguage(textObj) {
-    $('label[for="company-id"]').text(textObj.companyId)
+    $('label[for="company-identifier"]').text(textObj.companyId)
     $('label[for="api-key"]').text(textObj.apiKey)
     $('button#connect').text(textObj.connect)
     $('.logsText').text(textObj.logs)
