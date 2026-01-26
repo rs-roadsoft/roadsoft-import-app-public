@@ -1,3 +1,3 @@
 module.exports = {
-  baseUrl: 'https://api.stg.rs-roadsoft.com',
+  baseUrl: 'http://localhost:3030',
 };

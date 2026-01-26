@@ -7,6 +7,7 @@ require('@electron/remote/main').initialize();
 const axios = require('axios');
 const path = require('path');
 const fs = require('fs');
+const FormData = require('form-data');
 const { autoUpdater } = require('electron-updater');
 const log = require('electron-log');
 const AutoLaunch = require('auto-launch');
@@ -556,12 +557,11 @@ async function syncFolder(folder) {
   for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
     const batch = batches[batchIndex];
 
-    // Prepare batch data
-    const filesData = batch.map((file) => ({
-      fileName: path.basename(file),
-      downloadDate: new Date().toISOString().split('.')[0],
-      fileBytes: fs.readFileSync(file, { encoding: 'base64' }),
-    }));
+    // Prepare FormData with files
+    let formData = new FormData();
+    for (const file of batch) {
+      formData.append('files', fs.createReadStream(file), path.basename(file));
+    }
 
     // Send with retry on queue overflow
     let retries = 0;
@@ -574,10 +574,12 @@ async function syncFolder(folder) {
           url: `${setting.baseUrl}/api/v2/tachofile/import/company/${companyId}/bulk`,
           headers: {
             'API-KEY': apiKey,
-            'Content-Type': 'application/json',
+            ...formData.getHeaders(),
             ...getCustomHeaders(),
           },
-          data: { files: filesData },
+          data: formData,
+          maxContentLength: Infinity,
+          maxBodyLength: Infinity,
         });
 
         if (response.data.jobId) {
@@ -604,6 +606,12 @@ async function syncFolder(folder) {
             `Queue full, waiting ${BULK_RETRY_DELAY_MS / 1000}s... (${retries}/${BULK_MAX_RETRIES})`,
           );
           await delay(BULK_RETRY_DELAY_MS);
+
+          // Recreate FormData for retry (stream is already consumed)
+          formData = new FormData();
+          for (const file of batch) {
+            formData.append('files', fs.createReadStream(file), path.basename(file));
+          }
         } else {
           // Other error — mark entire batch as failed
           console.log('Error: ', error);
