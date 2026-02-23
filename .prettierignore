@@ -9,6 +9,7 @@ frontend/images
 frontend/js
 
 app/
+docs/
 package-lock.json
 *.asar
 logs/

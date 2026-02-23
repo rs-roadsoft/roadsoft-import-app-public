@@ -61,6 +61,18 @@ npm run build
 - npm run dist
 - npm run dist:mac
 
+## Generate Client IT Specification (PDF)
+
+```bash
+npm run generate:spec
+```
+
+Produces 1-page PDF specifications for customer IT departments in three languages:
+
+- `docs/CLIENT_SPECIFICATION_en.pdf` — English
+- `docs/CLIENT_SPECIFICATION_nl.pdf` — Nederlands
+- `docs/CLIENT_SPECIFICATION_de.pdf` — Deutsch
+
 ## Project Publish
 
 npx electron-builder --win --x64 -p always

@@ -11,7 +11,8 @@
     "dist": "electron-builder --win --x64",
     "dist:mac": "npx electron-builder --mac",
     "format": "prettier --write .",
-    "format:check": "prettier --check ."
+    "format:check": "prettier --check .",
+    "generate:spec": "node scripts/generate-spec.js"
   },
   "lint-staged": {
     "**/*.{js,ts,jsx,tsx,css,scss,md,json,html}": "prettier --write --ignore-path .prettierignore --ignore-unknown"
@@ -38,7 +39,9 @@
     "electron-packager": "^15.5.1",
     "electron-reload": "^2.0.0-alpha.1",
     "electronmon": "^2.0.3",
+    "html-to-docx": "^1.8.0",
     "lint-staged": "^16.2.6",
+    "md-to-pdf": "^5.2.4",
     "prettier": "^3.6.2",
     "simple-git-hooks": "^2.13.1"
   },
