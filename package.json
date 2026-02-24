@@ -34,12 +34,12 @@
   "license": "1.0",
   "devDependencies": {
     "cross-env": "^10.1.0",
+    "docx": "^9.6.0",
     "electron": "^19.0.6",
     "electron-builder": "^23.6.0",
     "electron-packager": "^15.5.1",
     "electron-reload": "^2.0.0-alpha.1",
     "electronmon": "^2.0.3",
-    "html-to-docx": "^1.8.0",
     "lint-staged": "^16.2.6",
     "md-to-pdf": "^5.2.4",
     "prettier": "^3.6.2",
