@@ -4,3 +4,5 @@
 .DS_Store
 log.txt
 app/config_local.db
+docs/*.pdf
+docs/*.docx
