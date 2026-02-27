@@ -1,6 +1,6 @@
 {
   "name": "roadsoft",
-  "version": "2.1.9",
+  "version": "2.1.10",
   "description": "Project to sync file to roadsoft server",
   "main": "main.js",
   "scripts": {
@@ -56,6 +56,10 @@
   },
   "build": {
     "productName": "RoadSoft",
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    },
     "win": {
       "icon": "frontend/images/app-512.png",
       "target": [
