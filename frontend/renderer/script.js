@@ -34,11 +34,11 @@ addLog('Welcome to RoadSoft File Sync Utility');
 ipcRenderer.send('dbConfig:getPreset');
 
 ipcRenderer.on('dbConfig:setPreset', (e, data) => {
-  $('#company-id').val(data.companyId);
+  $('#company-identifier').val(data.companyIdentifier);
   $('#api-key').val(data.apiKey);
   $('#last-sync').text(data.lastSync);
   $('#folder-path').text(data.folderPath);
-  $('label[for="company-id"]').addClass('active');
+  $('label[for="company-identifier"]').addClass('active');
   $('label[for="api-key"]').addClass('active');
   // Select schedule option safely
   if (data.syncSchedule) {
@@ -61,20 +61,20 @@ ipcRenderer.on('sync:changeStatusToProcessing', () => {
 // =============================== Connect =================================
 $('#connect').on('click', function () {
   connected = false;
-  const companyId = $('#company-id').val();
+  const companyIdentifier = $('#company-identifier').val();
   const apiKey = $('#api-key').val();
 
-  if (!companyId || !apiKey) {
+  if (!companyIdentifier || !apiKey) {
     addLog('Please fill company identifier and api key.');
     return;
   }
 
-  if (!UUID_REGEX.test(companyId)) {
+  if (!UUID_REGEX.test(companyIdentifier)) {
     addLog('Company Identifier format is invalid. Example: 123e4567-e89b-12d3-a456-426614174000');
     return;
   }
 
-  ipcRenderer.send('config:authenticate', { companyId, apiKey });
+  ipcRenderer.send('config:authenticate', { companyIdentifier, apiKey });
 });
 
 ipcRenderer.on('sync:updateFiles', () => {
@@ -375,9 +375,8 @@ function changeStatusToProcessing() {
  * Safe remove helper (overwrite support, ROOT-GUARDED).
  * Moves a file or directory to trash if it exists, but only if it's inside `rootGuard`.
  * Uses trash package for cross-platform support (works with folders on Windows).
- * Note: This is async but called in fire-and-forget manner for compatibility with existing code.
  */
-function removePathRecursiveSyncSafe(targetPath, rootGuard) {
+async function removePathRecursiveSyncSafe(targetPath, rootGuard) {
   // Guard: never allow deletions outside selected root
   if (!isPathInside(rootGuard, targetPath) && realResolve(targetPath) !== realResolve(rootGuard)) {
     addLog(`[Guard] Refusing to remove outside root: ${targetPath}`);
@@ -385,13 +384,12 @@ function removePathRecursiveSyncSafe(targetPath, rootGuard) {
   }
   if (!fs.existsSync(targetPath)) return;
 
-  trash(targetPath)
-    .then(() => {
-      addLog(`[Trash] Moved to trash: ${targetPath}`);
-    })
-    .catch((err) => {
-      addLog(`Trash error for ${targetPath}: ${err.message}`);
-    });
+  try {
+    await trash(targetPath);
+    addLog(`[Trash] Moved to trash: ${targetPath}`);
+  } catch (err) {
+    addLog(`Trash error for ${targetPath}: ${err.message}`);
+  }
 }
 
 /**
@@ -401,7 +399,7 @@ function removePathRecursiveSyncSafe(targetPath, rootGuard) {
  * - update only that row's status
  * - overwrite behavior is atomic: delete destination first, with root guard
  */
-ipcRenderer.on('sync:updateStatus', function (event, data) {
+ipcRenderer.on('sync:updateStatus', async function (event, data) {
   const absoluteFilePath = data.fileName;
   const rootFolder = $('#folder-path').text();
 
@@ -413,12 +411,13 @@ ipcRenderer.on('sync:updateStatus', function (event, data) {
   if (!isPathInside(rootResolved, fileResolved)) {
     addLog(`[Guard] Skip moving outside root: ${absoluteFilePath}`);
   } else {
+    const escapedFilePath = escapeHtml(absoluteFilePath);
     const rowIndexes = filesDataTable
       .rows()
       .indexes()
       .filter(function (value) {
         const rowData = filesDataTable.row(value).data();
-        return rowData[0].includes(absoluteFilePath);
+        return rowData[0].includes(escapedFilePath);
       });
 
     // Move file/folder into Archived or Failed
@@ -440,11 +439,13 @@ ipcRenderer.on('sync:updateStatus', function (event, data) {
         if (isPathInside(targetRootDir, destFilePath) || realResolve(destFilePath) === realResolve(targetRootDir)) {
           // Ensure overwrite semantics on all platforms
           if (fs.existsSync(destFilePath)) {
-            removePathRecursiveSyncSafe(destFilePath, rootResolved);
+            await removePathRecursiveSyncSafe(destFilePath, rootResolved);
           }
-          fs.rename(fileResolved, destFilePath, (err) => {
-            if (err) addLog(`Error moving file: ${err?.message}`);
-          });
+          try {
+            await fs.promises.rename(fileResolved, destFilePath);
+          } catch (err) {
+            addLog(`Error moving file: ${err?.message}`);
+          }
         } else {
           addLog(`[Guard] Refuse to move top-level file outside target dir: ${destFilePath}`);
         }
@@ -468,11 +469,13 @@ ipcRenderer.on('sync:updateStatus', function (event, data) {
 
           if (srcOk && dstOk && fs.existsSync(srcTopFolderPath)) {
             if (fs.existsSync(destTopFolderPath)) {
-              removePathRecursiveSyncSafe(destTopFolderPath, rootResolved);
+              await removePathRecursiveSyncSafe(destTopFolderPath, rootResolved);
             }
-            fs.rename(srcTopFolderPath, destTopFolderPath, (err) => {
-              if (err) addLog(`Error moving folder: ${err?.message}`);
-            });
+            try {
+              await fs.promises.rename(srcTopFolderPath, destTopFolderPath);
+            } catch (err) {
+              addLog(`Error moving folder: ${err?.message}`);
+            }
           } else {
             addLog(
               `[Guard] Refuse to move folder. srcOk=${srcOk} dstOk=${dstOk} src=${srcTopFolderPath} dst=${destTopFolderPath}`,

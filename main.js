@@ -7,6 +7,7 @@ require('@electron/remote/main').initialize();
 const axios = require('axios');
 const path = require('path');
 const fs = require('fs');
+const FormData = require('form-data');
 const { autoUpdater } = require('electron-updater');
 const log = require('electron-log');
 const AutoLaunch = require('auto-launch');
@@ -28,8 +29,25 @@ const DIRS = Object.freeze({ ARCHIVED: 'Archived', FAILED: 'Failed' });
 const EXT = Object.freeze({ DDD: '.ddd', ESM: '.esm' });
 const PLATFORMS = Object.freeze({ MAC: 'darwin', WIN: 'win32' });
 
+// Bulk API constants
+const BULK_BATCH_SIZE = 100;
+const BULK_RETRY_DELAY_MS = 30000; // 30 seconds
+const BULK_MAX_RETRIES = 20;
+
+function chunk(array, size) {
+  const result = [];
+  for (let i = 0; i < array.length; i += size) {
+    result.push(array.slice(i, i + size));
+  }
+  return result;
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 let mainWindow;
-let companyId = '';
+let companyIdentifier = '';
 let apiKey = '';
 let lastSync = '';
 let folderPath = '';
@@ -45,7 +63,7 @@ autoUpdater.autoInstallOnAppQuit = true;
 async function preset() {
   // preload persisted settings from local DB so renderer can request them fast
   apiKey = await dbConfig.getSetting('api_key');
-  companyId = await dbConfig.getSetting('company_id');
+  companyIdentifier = await dbConfig.getSetting('company_id');
   lastSync = await dbConfig.getSetting('last_sync');
   folderPath = await dbConfig.getSetting('folder_path');
 }
@@ -330,7 +348,7 @@ ipcMain.on('dbConfig:getPreset', async () => {
   const syncSchedule = await dbConfig.getSetting('sync_schedule');
 
   mainWindow.webContents.send('dbConfig:setPreset', {
-    companyId,
+    companyIdentifier,
     apiKey,
     lastSync,
     folderPath,
@@ -340,7 +358,7 @@ ipcMain.on('dbConfig:getPreset', async () => {
 
 // validate credentials against API and persist them locally
 ipcMain.on('config:authenticate', async (e, data) => {
-  await connect(data.companyId, data.apiKey);
+  await connect(data.companyIdentifier, data.apiKey);
 });
 
 ipcMain.on('dbConfig:setFolderPath', async (e, newFolderPath) => {
@@ -355,8 +373,8 @@ ipcMain.on('sync:previousSchedule', async () => {
   const scheduleTrigger = await dbConfig.getSetting('sync_schedule');
 
   // Always try to reconnect if we have credentials (fixes "not connected" on restart)
-  if (companyId && apiKey) {
-    const connection = await connect(companyId, apiKey);
+  if (companyIdentifier && apiKey) {
+    const connection = await connect(companyIdentifier, apiKey);
 
     // Only restore schedule if connection succeeded and we have a folder
     if (connection && folderPath && scheduleTrigger) {
@@ -401,9 +419,9 @@ async function connect(company_id, api_key) {
 
     if (response) {
       apiKey = api_key;
-      companyId = company_id;
+      companyIdentifier = company_id;
       dbConfig.setSetting('api_key', apiKey);
-      dbConfig.setSetting('company_id', companyId);
+      dbConfig.setSetting('company_id', companyIdentifier);
       dbConfig.refreshLastSync();
       mainWindow.webContents.send('config:success');
 
@@ -470,11 +488,22 @@ function scheduleSyncOnHour(hour) {
 }
 
 ipcMain.on('sync:start', async () => {
-  const connection = await connect(companyId, apiKey);
+  const connection = await connect(companyIdentifier, apiKey);
   if (connection) syncFolder(folderPath);
 });
 
 /* ===================================== SYNC LOGIC (updated) ===================================== */
+function logFileResult(file, success, errorMessage = '') {
+  const logFilePath = path.join(app.getPath('userData'), 'log.txt');
+
+  if (!fs.existsSync(logFilePath)) {
+    fs.writeFileSync(logFilePath, '', { flag: 'w' });
+  }
+
+  const status = success ? 'Success' : `Failed: ${errorMessage}`;
+  fs.appendFileSync(logFilePath, `[${new Date().toLocaleString()}] (${status}) ${path.basename(file)}\n`);
+}
+
 function generateSyncSummary(stats) {
   let message = '';
 
@@ -522,74 +551,106 @@ async function syncFolder(folder) {
   // Track completion of all file uploads
   const syncStats = { total: 0, success: 0, failed: 0 };
 
-  // upload each file to the API using axios.then() so renderer can update per-file status
-  filesToSync.forEach((file) => {
-    const data = JSON.stringify({
-      fileName: path.basename(file),
-      downloadDate: new Date().toISOString().split('.')[0],
-      fileBytes: fs.readFileSync(file, { encoding: 'base64' }),
-    });
+  // Split files into batches for bulk API
+  const batches = chunk(filesToSync, BULK_BATCH_SIZE);
 
-    const config = {
-      method: 'post',
-      url: `${setting.baseUrl}/api/v2/tachofile/import/company/${companyId}`,
-      headers: {
-        'API-KEY': apiKey,
-        'Content-Type': 'application/json',
-        ...getCustomHeaders(),
-      },
-      data,
-    };
+  for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
+    const batch = batches[batchIndex];
 
-    axios(config)
-      .then(function (response) {
-        if (response.data.jobId) {
-          syncStats.success++;
-          mainWindow.webContents.send('sync:updateStatus', {
-            code: 200,
-            message: 'Synced successfully',
-            fileName: file,
-            status: 'Synced',
-          });
-        } else {
-          syncStats.failed++;
-          mainWindow.webContents.send('sync:updateStatus', {
-            code: response.status,
-            message: 'Error occured by API',
-            fileName: file,
-            status: 'Not Synced',
+    // Prepare FormData with files
+    let formData = new FormData();
+    for (const file of batch) {
+      formData.append('files', fs.createReadStream(file), path.basename(file));
+    }
+
+    // Send with retry on queue overflow
+    let retries = 0;
+    let shouldExitRetryLoop = false;
+
+    while (!shouldExitRetryLoop && retries < BULK_MAX_RETRIES) {
+      try {
+        const response = await axios({
+          method: 'post',
+          url: `${setting.baseUrl}/api/v2/tachofile/import/company/${companyIdentifier}/bulk`,
+          headers: {
+            'API-KEY': apiKey,
+            ...formData.getHeaders(),
+            ...getCustomHeaders(),
+          },
+          data: formData,
+          maxContentLength: Infinity,
+          maxBodyLength: Infinity,
+        });
+
+        if (response.data && response.data.jobId) {
+          // Success — update status for all files in batch
+          syncStats.success += batch.length;
+          batch.forEach((file) => {
+            mainWindow.webContents.send('sync:updateStatus', {
+              code: 200,
+              message: 'Synced successfully',
+              fileName: file,
+              status: 'Synced',
+            });
+            logFileResult(file, true);
           });
         }
-      })
-      .catch(function (error) {
-        console.log('Error: ', error);
-        syncStats.failed++;
+        shouldExitRetryLoop = true;
+      } catch (error) {
+        const codeName = error.response?.data?.codeName;
+
+        if (codeName === 'file-upload/too-many-files-in-queue') {
+          retries++;
+          mainWindow.webContents.send(
+            'system:log',
+            `Queue full, waiting ${BULK_RETRY_DELAY_MS / 1000}s... (${retries}/${BULK_MAX_RETRIES})`,
+          );
+          await delay(BULK_RETRY_DELAY_MS);
+
+          // Recreate FormData for retry (stream is already consumed)
+          formData = new FormData();
+          for (const file of batch) {
+            formData.append('files', fs.createReadStream(file), path.basename(file));
+          }
+        } else {
+          // Other error — mark entire batch as failed
+          console.log('Error: ', error);
+          syncStats.failed += batch.length;
+          batch.forEach((file) => {
+            mainWindow.webContents.send('sync:updateStatus', {
+              code: error.response?.status || 500,
+              message: error.message || 'Error occurred by API',
+              fileName: file,
+              status: 'Not Synced',
+            });
+            logFileResult(file, false, error.message);
+          });
+          shouldExitRetryLoop = true; // Exit retry loop
+        }
+      }
+    }
+
+    // Max retries exceeded — mark as failed
+    if (!shouldExitRetryLoop) {
+      syncStats.failed += batch.length;
+      batch.forEach((file) => {
         mainWindow.webContents.send('sync:updateStatus', {
-          code: 500,
-          message: 'Error occured by API',
+          code: 503,
+          message: 'Max retries exceeded',
           fileName: file,
           status: 'Not Synced',
         });
-      })
-      .finally(function () {
-        // Increment total counter
-        syncStats.total++;
-
-        // When all files are processed, log summary message
-        if (syncStats.total === filesToSync.length) {
-          const summaryMessage = generateSyncSummary(syncStats);
-          mainWindow.webContents.send('system:log', summaryMessage);
-        }
+        logFileResult(file, false, 'Max retries exceeded');
       });
-
-    const logFilePath = path.join(app.getPath('userData'), 'log.txt');
-
-    if (!fs.existsSync(logFilePath)) {
-      fs.writeFileSync(logFilePath, '', { flag: 'w' });
     }
 
-    fs.appendFileSync(logFilePath, `[${new Date().toLocaleString()}] (Success) ${path.basename(file)}\n`);
-  });
+    syncStats.total += batch.length;
+    mainWindow.webContents.send('system:log', `Batch ${batchIndex + 1}/${batches.length} complete`);
+  }
+
+  // Final summary message
+  const summaryMessage = generateSyncSummary(syncStats);
+  mainWindow.webContents.send('system:log', summaryMessage);
 
   // tell renderer to update "last sync" timestamp in UI
   mainWindow.webContents.send('system:update-last-sync', new Date().toLocaleString());
