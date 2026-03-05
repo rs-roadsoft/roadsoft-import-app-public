@@ -1,6 +1,6 @@
 /* eslint-disable no-useless-escape */
 const electron = require('electron');
-const { ipcRenderer } = electron;
+const { ipcRenderer, shell } = electron;
 const { app, dialog } = require('@electron/remote');
 const fs = require('fs');
 const path = require('path');

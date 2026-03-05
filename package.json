@@ -1,6 +1,6 @@
 {
   "name": "roadsoft",
-  "version": "2.1.10",
+  "version": "2.1.11",
   "description": "Project to sync file to roadsoft server",
   "main": "main.js",
   "scripts": {

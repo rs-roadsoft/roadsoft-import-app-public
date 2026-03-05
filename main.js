@@ -75,6 +75,7 @@ function createWindow(startMinimized = false) {
       nodeIntegration: true,
       enableRemoteModule: true,
       contextIsolation: false,
+      backgroundThrottling: false,
     },
     icon: path.join(__dirname, 'frontend/images/app-512.png'),
     show: false,
@@ -142,7 +143,7 @@ function createWindow(startMinimized = false) {
 }
 
 function createTray() {
-  tray = new Tray(path.join(__dirname, 'frontend/images/app.png'));
+  tray = new Tray(path.join(__dirname, 'frontend/images/logo_w.png'));
   tray.setToolTip('RoadSoft');
   const contextMenu = Menu.buildFromTemplate([
     {
