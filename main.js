@@ -8,7 +8,8 @@ const axios = require('axios');
 const path = require('path');
 const fs = require('fs');
 const FormData = require('form-data');
-const { autoUpdater } = require('electron-updater');
+// TODO: enable auto updater after setting up code signing key
+// const { autoUpdater } = require('electron-updater');
 const log = require('electron-log');
 const AutoLaunch = require('auto-launch');
 
@@ -57,8 +58,9 @@ let lastScheduleCheck = Date.now();
 let scheduleInterval = null; // in milliseconds
 let isWindowVisible = true;
 
-autoUpdater.autoDownload = false;
-autoUpdater.autoInstallOnAppQuit = true;
+// TODO: enable auto updater after setting up code signing key
+// autoUpdater.autoDownload = false;
+// autoUpdater.autoInstallOnAppQuit = true;
 
 async function preset() {
   // preload persisted settings from local DB so renderer can request them fast
@@ -209,8 +211,8 @@ app.whenReady().then(async () => {
     }
   });
 
-  // trigger auto updater on startup
-  autoUpdater.checkForUpdatesAndNotify();
+  // TODO: enable auto updater after setting up code signing key
+  // autoUpdater.checkForUpdatesAndNotify();
 
   // Handle system resume from sleep/suspend
   powerMonitor.on('resume', () => {
@@ -272,25 +274,26 @@ app.whenReady().then(async () => {
 });
 
 /* ===================================== Auto Update ===================================== */
-autoUpdater.on('update-available', () => {
-  log.info('update-available');
-  autoUpdater.downloadUpdate();
-});
-
-autoUpdater.on('checking-for-update', () => {
-  log.info('checking-for-update');
-});
-
-autoUpdater.on('error', (message) => {
-  log.info('error');
-  log.info(typeof message);
-  log.info(message);
-});
-
-autoUpdater.on('update-downloaded', () => {
-  log.info('update-downloaded');
-});
-
+// TODO: enable auto updater after setting up code signing key
+// autoUpdater.on('update-available', () => {
+//   log.info('update-available');
+//   autoUpdater.downloadUpdate();
+// });
+//
+// autoUpdater.on('checking-for-update', () => {
+//   log.info('checking-for-update');
+// });
+//
+// autoUpdater.on('error', (message) => {
+//   log.info('error');
+//   log.info(typeof message);
+//   log.info(message);
+// });
+//
+// autoUpdater.on('update-downloaded', () => {
+//   log.info('update-downloaded');
+// });
+//
 // end of auto update
 app.on('window-all-closed', function () {
   if (process.platform !== PLATFORMS.MAC) app.quit();
