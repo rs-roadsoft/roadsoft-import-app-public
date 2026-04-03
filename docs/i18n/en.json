@@ -1,8 +1,8 @@
 {
   "app_suffix": "Import Application",
   "app_name": "RoadSoft Import Application",
-  "footer": "RoadSoft Import Application — Client IT Specification — v2.1.8",
-  "subtitle": "IT Specification &mdash; Version 2.1.8",
+  "footer": "RoadSoft Import Application — Client IT Specification — v2.1.15",
+  "subtitle": "IT Specification &mdash; Version 2.1.15",
   "section_overview": "Application Overview",
   "label_name": "Name",
   "label_purpose": "Purpose",
@@ -24,7 +24,7 @@
   "label_privileges": "Privileges",
   "privileges_value": "No administrator or root privileges required",
   "important_label": "Important",
-  "important_peruser": "RoadSoft installs <strong>per user</strong>, not per computer. Each user who requires the application must install it under their own operating system user profile.",
+  "important_peruser": "RoadSoft installs <strong>per user account by default</strong> (<em>AppData\\Local\\Programs</em>), but the installation directory can be changed during setup. Note that user data (configuration, logs) is always stored per user account in <em>AppData\\Roaming</em>.",
   "section_locations": "File Locations",
   "label_app": "Application",
   "label_userdata": "User data",
@@ -46,6 +46,6 @@
   "note_file_processing": "Both folders are created automatically inside the selected sync folder. They are excluded from future scans, so files placed there will not be re-processed.",
   "note_zip_trash": "After a `.zip` archive is successfully extracted, the original `.zip` file is automatically moved to the OS recycle bin and can be restored from there if needed.",
   "section_updates": "Updates & Maintenance",
-  "autolaunch": "<strong>Auto-launch on system startup</strong> is supported and configurable within the application",
-  "tray": "<strong>Minimize to system tray</strong> is supported (optional)"
+  "autolaunch": "Auto-launch on system startup is supported and configurable within the application",
+  "tray": "Minimize to system tray is supported (optional)"
 }
