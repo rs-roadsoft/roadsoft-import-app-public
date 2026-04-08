@@ -1,8 +1,8 @@
 {
   "app_suffix": "Import Application",
   "app_name": "RoadSoft Import Application",
-  "footer": "RoadSoft Import Application — IT-Spezifikation für Kunden — v2.1.8",
-  "subtitle": "IT-Spezifikation &mdash; Version 2.1.8",
+  "footer": "RoadSoft Import Application — IT-Spezifikation für Kunden — v2.1.15",
+  "subtitle": "IT-Spezifikation &mdash; Version 2.1.15",
   "section_overview": "Anwendungsübersicht",
   "label_name": "Name",
   "label_purpose": "Zweck",
@@ -24,7 +24,7 @@
   "label_privileges": "Berechtigungen",
   "privileges_value": "Keine Administrator- oder Root-Rechte erforderlich",
   "important_label": "Wichtig",
-  "important_peruser": "RoadSoft wird <strong>pro Benutzer</strong> installiert, nicht pro Computer. Jeder Benutzer, der die Anwendung benötigt, muss sie unter seinem eigenen Betriebssystemprofil installieren.",
+  "important_peruser": "RoadSoft wird standardmäßig <strong>pro Benutzerkonto</strong> installiert (<em>AppData\\Local\\Programs</em>), das Installationsverzeichnis kann jedoch während der Installation geändert werden. Hinweis: Benutzerdaten (Konfiguration, Logs) werden immer pro Benutzerkonto in <em>AppData\\Roaming</em> gespeichert.",
   "section_locations": "Dateispeicherorte",
   "label_app": "Anwendung",
   "label_userdata": "Benutzerdaten",
@@ -46,6 +46,6 @@
   "note_file_processing": "Beide Ordner werden automatisch im ausgewählten Synchronisationsordner erstellt. Sie werden bei zukünftigen Scans ausgeschlossen, sodass dort abgelegte Dateien nicht erneut verarbeitet werden.",
   "note_zip_trash": "Nachdem ein `.zip`-Archiv erfolgreich entpackt wurde, wird die ursprüngliche `.zip`-Datei automatisch in den Papierkorb des Betriebssystems verschoben und kann bei Bedarf von dort wiederhergestellt werden.",
   "section_updates": "Updates & Wartung",
-  "autolaunch": "<strong>Automatischer Start beim Systemstart</strong> wird unterstützt und ist in der Anwendung konfigurierbar",
-  "tray": "<strong>Minimieren in die Taskleiste</strong> wird unterstützt (optional)"
+  "autolaunch": "Automatischer Start beim Systemstart wird unterstützt und ist in der Anwendung konfigurierbar",
+  "tray": "Minimieren in die Taskleiste wird unterstützt (optional)"
 }

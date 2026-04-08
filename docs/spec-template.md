@@ -36,10 +36,10 @@ css: |-
 
 ## {{section_overview}}
 
-- **{{label_name}}:** {{app_name}}
-- **{{label_purpose}}:** {{purpose}}
-- **{{label_type}}:** {{type}}
-- **{{label_platforms}}:** Windows 10/11 (x64)
+- {{label_name}}: {{app_name}}
+- {{label_purpose}}: {{purpose}}
+- {{label_type}}: {{type}}
+- {{label_platforms}}: Windows 10/11 (x64)
 
 ## {{section_requirements}}
 
@@ -51,20 +51,20 @@ css: |-
 
 ## {{section_installation}}
 
-- **{{label_installer_type}}:**
+- {{label_installer_type}}:
   - Windows: NSIS {{installer_desc}} (`.exe`)
-- **{{label_privileges}}:** {{privileges_value}}
+- {{label_privileges}}: {{privileges_value}}
 
 <div class="note"><p><strong>{{important_label}}:</strong> {{important_peruser}}</p></div>
 
 ## {{section_locations}}
 
-- **{{label_app}}:**
-  `C:\Users\{{{username_placeholder}}}\AppData\Local\Programs\RoadSoft\`
-- **{{label_userdata}}** ({{userdata_desc}}):
-  `C:\Users\{{{username_placeholder}}}\AppData\Roaming\RoadSoft\`
-  - `config.db` — {{db_desc}}
-  - `log.txt` — {{log_desc}}
+- {{label_app}}:
+  C:\Users\{{{username_placeholder}}}\AppData\Local\Programs\RoadSoft\
+- {{label_userdata}} ({{userdata_desc}}):
+  C:\Users\{{{username_placeholder}}}\AppData\Roaming\RoadSoft\
+  - <em>config.db</em> — {{db_desc}}
+  - <em>log.txt</em> — {{log_desc}}
 
 <div class="note"><p><strong>{{note_label}}:</strong> {{note_hidden}}</p></div>
 
@@ -72,16 +72,24 @@ css: |-
 
 {{file_processing_intro}}
 
+<div style="margin-top: 6px;">
+
 | {{col_folder}} | {{col_purpose}} | {{col_contents}} |
 | -------------- | --------------- | ---------------- |
 | `Archived/`    | {{archived_purpose}} | {{archived_contents}} |
 | `Failed/`      | {{failed_purpose}} | {{failed_contents}} |
 
+</div>
+
 <div class="note"><p><strong>{{note_label}}:</strong> {{note_file_processing}}</p></div>
 
 <div class="note"><p><strong>{{note_label}}:</strong> {{note_zip_trash}}</p></div>
 
+<div style="margin-top: 6px;">
+
 ## {{section_updates}}
 
-- **{{autolaunch}}**
-- **{{tray}}**
+</div>
+
+- {{autolaunch}}
+- {{tray}}

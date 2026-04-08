@@ -1,8 +1,8 @@
 {
   "app_suffix": "Import applicatie",
   "app_name": "RoadSoft Import applicatie",
-  "footer": "RoadSoft Import applicatie — IT-specificatie voor klanten — v2.1.8",
-  "subtitle": "IT-specificatie &mdash; Versie 2.1.8",
+  "footer": "RoadSoft Import applicatie — IT-specificatie voor klanten — v2.1.15",
+  "subtitle": "IT-specificatie &mdash; Versie 2.1.15",
   "section_overview": "Applicatie overzicht",
   "label_name": "Naam",
   "label_purpose": "Doel",
@@ -24,7 +24,7 @@
   "label_privileges": "Rechten",
   "privileges_value": "Geen beheerders- of rootrechten vereist",
   "important_label": "Belangrijk",
-  "important_peruser": "RoadSoft wordt <strong>per gebruiker</strong> geïnstalleerd, niet per computer. Elke gebruiker die de applicatie nodig heeft, moet deze installeren onder zijn eigen besturingssysteemprofiel.",
+  "important_peruser": "RoadSoft wordt standaard <strong>per gebruikersaccount</strong> geïnstalleerd (<em>AppData\\Local\\Programs</em>), maar de installatiemap kan tijdens de installatie worden gewijzigd. Let op: gebruikersgegevens (configuratie, logs) worden altijd per gebruikersaccount opgeslagen in <em>AppData\\Roaming</em>.",
   "section_locations": "Bestandslocaties",
   "label_app": "Applicatie",
   "label_userdata": "Gebruikersgegevens",
@@ -46,6 +46,6 @@
   "note_file_processing": "Beide mappen worden automatisch aangemaakt in de geselecteerde synchronisatiemap. Ze worden uitgesloten van toekomstige scans, zodat bestanden die daar staan niet opnieuw worden verwerkt.",
   "note_zip_trash": "Nadat een `.zip`-archief succesvol is uitgepakt, wordt het originele `.zip`-bestand automatisch naar de prullenbak van het besturingssysteem verplaatst en kan het indien nodig van daaruit worden hersteld.",
   "section_updates": "Updates & onderhoud",
-  "autolaunch": "<strong>Automatisch starten bij opstarten</strong> wordt ondersteund en is configureerbaar in de applicatie",
-  "tray": "<strong>Minimaliseren naar systeemvak</strong> wordt ondersteund (optioneel)"
+  "autolaunch": "Automatisch starten bij opstarten wordt ondersteund en is configureerbaar in de applicatie",
+  "tray": "Minimaliseren naar systeemvak wordt ondersteund (optioneel)"
 }
