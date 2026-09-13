@@ -126,7 +126,20 @@ async function runSync({ db, api, folder, gather, log, onFileStatus = () => {} }
 
     // Only rows the journal has not settled are worth a question.
     const open = entries.filter((entry) => !verdicts.isTerminal(rows.get(entry.hash)));
-    const answers = open.length ? await api.hashCheck(open.map((entry) => entry.hash)) : new Map();
+    let answers = new Map();
+    if (open.length) {
+      try {
+        answers = await api.hashCheck(open.map((entry) => entry.hash));
+      } catch (error) {
+        // The server could not be asked at all. That is not a verdict on any
+        // file and not a failed upload of any file, so nothing is counted
+        // against anything: a network outage must not walk a folder of good
+        // files toward the attempt cap. The run stops here and the next
+        // scheduled one asks again.
+        log(`Server unreachable, sync postponed: ${describeError(error)}`);
+        return { total: entries.length, sent: 0, skipped: 0, failed: 0, unreachable: true };
+      }
+    }
     const toUpload = [];
     for (const entry of open) {
       const verdict = verdicts.fromHashCheck(answers.get(entry.hash));
@@ -167,6 +180,7 @@ async function runSync({ db, api, folder, gather, log, onFileStatus = () => {} }
 
 function summarize(counts) {
   if (counts.skipped === true) return 'Sync skipped: another sync is running';
+  if (counts.unreachable) return `Sync postponed: server unreachable, ${counts.total} file(s) left for the next run`;
   const parts = [];
   if (counts.sent) parts.push(`uploaded ${counts.sent}`);
   if (counts.skipped) parts.push(`already known ${counts.skipped}`);

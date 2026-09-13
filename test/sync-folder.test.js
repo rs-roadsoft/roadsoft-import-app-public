@@ -251,6 +251,26 @@ test('a second trigger while a run is in flight is refused rather than doubled',
   assert.equal(api.calls.uploadBatch.length, 1);
 });
 
+test('a server that cannot be asked postpones the run and counts nothing against any file', async () => {
+  // Distinct from a failed upload. A failed upload is a fact about one batch;
+  // an unreachable server is a fact about the network, and three hours of it
+  // must not park a folder of perfectly good files.
+  const file = writeFile('a.ddd', 'A');
+  const api = fakeApi();
+  api.hashCheck = async () => {
+    throw Object.assign(new Error('connect ETIMEDOUT 127.0.0.1:1'), { code: 'ETIMEDOUT' });
+  };
+
+  const counts = await run(api);
+
+  assert.equal(counts.unreachable, true);
+  assert.equal(api.calls.uploadBatch.length, 0);
+  const row = await db(journal.JOURNAL).where({ hash: file.hash }).first();
+  assert.equal(row.state, STATE.PENDING);
+  assert.equal(row.attempts, 0, 'no attempt was charged');
+  assert.equal(row.reason_source, null);
+});
+
 test('an empty folder is a no-op that still settles open jobs', async () => {
   const api = fakeApi();
   const counts = await run(api);

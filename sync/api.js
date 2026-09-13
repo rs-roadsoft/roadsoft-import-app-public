@@ -23,6 +23,18 @@ const QUEUE_FULL_RETRY_DELAY_MS = 30_000;
  * the sync moves on to the next batch.
  */
 const QUEUE_FULL_MAX_RETRIES = 5;
+/**
+ * Every request is bounded. Without a timeout a connection that never answers
+ * — a filtered port, a half-open proxy — holds the run open indefinitely, and
+ * because only one run may be in flight, every later scheduled trigger is then
+ * refused as "already running": the app stops syncing until it is restarted,
+ * silently. Found by pointing the sync at a dead port.
+ *
+ * The upload gets longer: a 100-file batch is tens of megabytes, and the
+ * customer's uplink is what sets the pace (production measured ~0.65 MB/s).
+ */
+const REQUEST_TIMEOUT_MS = 30_000;
+const UPLOAD_TIMEOUT_MS = 5 * 60_000;
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -37,7 +49,11 @@ function createApi({ baseUrl, companyId, apiKey, headers }) {
     const results = new Map();
     for (let index = 0; index < hashes.length; index += HASH_CHECK_BATCH_SIZE) {
       const batch = hashes.slice(index, index + HASH_CHECK_BATCH_SIZE);
-      const response = await axios.post(`${companyUrl}/hash-check`, { hashes: batch }, { headers: authHeaders });
+      const response = await axios.post(
+        `${companyUrl}/hash-check`,
+        { hashes: batch },
+        { headers: authHeaders, timeout: REQUEST_TIMEOUT_MS },
+      );
       for (const result of response.data?.results ?? []) {
         results.set(result.hash, result.status);
       }
@@ -67,6 +83,7 @@ function createApi({ baseUrl, companyId, apiKey, headers }) {
           headers: { ...authHeaders, ...form.getHeaders() },
           maxContentLength: Infinity,
           maxBodyLength: Infinity,
+          timeout: UPLOAD_TIMEOUT_MS,
         });
         return response.data;
       } catch (error) {
@@ -82,7 +99,10 @@ function createApi({ baseUrl, companyId, apiKey, headers }) {
 
   /** Every file the server holds under a job, with its status and its error. */
   async function getJobFiles(jobId) {
-    const response = await axios.get(`${companyUrl}/job/${jobId}`, { headers: authHeaders });
+    const response = await axios.get(`${companyUrl}/job/${jobId}`, {
+      headers: authHeaders,
+      timeout: REQUEST_TIMEOUT_MS,
+    });
     return Array.isArray(response.data) ? response.data : [];
   }
 
