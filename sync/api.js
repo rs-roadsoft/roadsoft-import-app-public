@@ -14,15 +14,14 @@ const FormData = require('form-data');
 const BULK_BATCH_SIZE = 100;
 /** Hashes per hash-check request — the server's `MAX_IMPORT_HASH_CHECK_BATCH`. */
 const HASH_CHECK_BATCH_SIZE = 1000;
-const QUEUE_FULL_CODE = 'FILE_UPLOAD_TOO_MANY_FILES_IN_QUEUE';
-const QUEUE_FULL_RETRY_DELAY_MS = 30_000;
 /**
- * Down from 20. Twenty waits of thirty seconds held one batch for ten minutes
- * while the rest of the folder queued behind it; five is two and a half
- * minutes, after which the batch is a transport failure the journal counts and
- * the sync moves on to the next batch.
+ * There is deliberately no "queue full, wait and retry" loop here. Earlier
+ * builds retried up to twenty times on a `too-many-files-in-queue` answer; the
+ * backend retired that code in RS-6709 — an upload over the company's intake
+ * quota is staged and released later, never refused — so the loop could no
+ * longer fire. Any refusal of a batch is what it looks like: a transport
+ * failure the journal counts against the files, and the sync moves on.
  */
-const QUEUE_FULL_MAX_RETRIES = 5;
 /**
  * Every request is bounded. Without a timeout a connection that never answers
  * — a filtered port, a half-open proxy — holds the run open indefinitely, and
@@ -35,10 +34,6 @@ const QUEUE_FULL_MAX_RETRIES = 5;
  */
 const REQUEST_TIMEOUT_MS = 30_000;
 const UPLOAD_TIMEOUT_MS = 5 * 60_000;
-
-function delay(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
 
 function createApi({ baseUrl, companyId, apiKey, headers }) {
   const authHeaders = { 'API-KEY': apiKey, ...headers };
@@ -70,31 +65,19 @@ function createApi({ baseUrl, companyId, apiKey, headers }) {
   }
 
   /**
-   * One bulk request, retried only on the server's "queue full" answer. Any
-   * other failure is thrown to the caller, which records it as a transport
-   * failure for the batch. Returns `{ jobId, files: [{ fileName, importId, hash }] }`.
+   * One bulk request. A failure is thrown to the caller, which records it as a
+   * transport failure for the batch. Returns
+   * `{ jobId, files: [{ fileName, importId, hash }] }`.
    */
-  async function uploadBatch(filePaths, onRetry = () => {}) {
-    for (let attempt = 1; ; attempt += 1) {
-      // A fresh form each time: the streams are consumed by the attempt that sends them.
-      const form = buildForm(filePaths);
-      try {
-        const response = await axios.post(`${companyUrl}/bulk`, form, {
-          headers: { ...authHeaders, ...form.getHeaders() },
-          maxContentLength: Infinity,
-          maxBodyLength: Infinity,
-          timeout: UPLOAD_TIMEOUT_MS,
-        });
-        return response.data;
-      } catch (error) {
-        const queueFull = error.response?.data?.codeName === QUEUE_FULL_CODE;
-        if (!queueFull || attempt >= QUEUE_FULL_MAX_RETRIES) {
-          throw error;
-        }
-        onRetry(attempt, QUEUE_FULL_MAX_RETRIES, QUEUE_FULL_RETRY_DELAY_MS);
-        await delay(QUEUE_FULL_RETRY_DELAY_MS);
-      }
-    }
+  async function uploadBatch(filePaths) {
+    const form = buildForm(filePaths);
+    const response = await axios.post(`${companyUrl}/bulk`, form, {
+      headers: { ...authHeaders, ...form.getHeaders() },
+      maxContentLength: Infinity,
+      maxBodyLength: Infinity,
+      timeout: UPLOAD_TIMEOUT_MS,
+    });
+    return response.data;
   }
 
   /** Every file the server holds under a job, with its status and its error. */
@@ -120,7 +103,6 @@ function describeError(error) {
 module.exports = {
   BULK_BATCH_SIZE,
   HASH_CHECK_BATCH_SIZE,
-  QUEUE_FULL_MAX_RETRIES,
   createApi,
   describeError,
 };

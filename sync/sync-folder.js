@@ -61,9 +61,7 @@ async function uploadOne({ db, api, log }, entries) {
   const paths = entries.map((entry) => entry.paths[0]);
   const hashes = entries.map((entry) => entry.hash);
   try {
-    const receipt = await api.uploadBatch(paths, (attempt, max, waitMs) =>
-      log(`Queue full, waiting ${waitMs / 1000}s... (${attempt}/${max})`),
-    );
+    const receipt = await api.uploadBatch(paths);
     const byHash = new Map((receipt?.files ?? []).map((file) => [file.hash, file]));
     await journal.markUploaded(
       db,
