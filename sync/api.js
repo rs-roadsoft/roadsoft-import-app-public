@@ -35,9 +35,9 @@ const HASH_CHECK_BATCH_SIZE = 1000;
 const REQUEST_TIMEOUT_MS = 30_000;
 const UPLOAD_TIMEOUT_MS = 5 * 60_000;
 
-function createApi({ baseUrl, companyId, apiKey, headers }) {
+function createApi({ baseUrl, companyIdentifier, apiKey, headers }) {
   const authHeaders = { 'API-KEY': apiKey, ...headers };
-  const companyUrl = `${baseUrl}/api/v2/tachofile/import/company/${companyId}`;
+  const companyUrl = `${baseUrl}/api/v2/tachofile/import/company/${companyIdentifier}`;
 
   /** `hash -> status` for every requested hash, over as many requests as needed. */
   async function hashCheck(hashes) {

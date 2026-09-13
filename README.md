@@ -28,7 +28,7 @@ It provides automatic sync scheduling, local configuration storage (SQLite), and
   prevents a file from being uploaded twice — the move can fail on a synced, locked or network folder
   and the journal still holds.
 - Supports automatic scheduled sync (every **1h / 12h / 24h** or **on app start**)
-- Local settings stored in **SQLite** database (Company ID, API key, folder, schedule)
+- Local settings and the upload history stored in **SQLite** database (Company ID, API key, folder, schedule, per-file upload results)
 - Minimize to tray and **auto-launch** on system startup
 - Cross-platform: **Windows** and **macOS**
 

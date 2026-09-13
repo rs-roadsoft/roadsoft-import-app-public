@@ -85,6 +85,18 @@ css: |-
 
 <div class="note"><p><strong>{{note_label}}:</strong> {{note_zip_trash}}</p></div>
 
+## {{section_upload_history}}
+
+{{upload_history_intro}}
+
+- {{upload_history_refused}}
+- {{upload_history_transport}}
+- {{upload_history_duplicate}}
+
+{{upload_history_reset}}
+
+<div class="note"><p><strong>{{note_label}}:</strong> {{note_upload_history}}</p></div>
+
 <div style="margin-top: 6px;">
 
 ## {{section_updates}}

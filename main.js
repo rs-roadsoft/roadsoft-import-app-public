@@ -481,7 +481,7 @@ async function syncFolder(folder) {
 
   const api = createApi({
     baseUrl: setting.baseUrl,
-    companyId: companyIdentifier,
+    companyIdentifier,
     apiKey,
     headers: getCustomHeaders(),
   });

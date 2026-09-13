@@ -257,6 +257,17 @@ async function generateDocx(i18n, locale) {
   children.push(noteBlock(i18n.note_label, i18n.note_zip_trash));
   children.push(new Paragraph({ spacing: { after: 80 } }));
 
+  // Section: Upload History
+  children.push(heading2(i18n.section_upload_history));
+  children.push(bodyParagraph(i18n.upload_history_intro));
+  children.push(simpleBullet(i18n.upload_history_refused));
+  children.push(simpleBullet(i18n.upload_history_transport));
+  children.push(simpleBullet(i18n.upload_history_duplicate));
+  children.push(new Paragraph({ spacing: { after: 40 } }));
+  children.push(bodyParagraph(i18n.upload_history_reset));
+  children.push(noteBlock(i18n.note_label, i18n.note_upload_history));
+  children.push(new Paragraph({ spacing: { after: 80 } }));
+
   // Section: Updates
   children.push(heading2(i18n.section_updates));
   children.push(simpleBullet(i18n.autolaunch));
