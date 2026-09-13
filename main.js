@@ -16,7 +16,7 @@ const dbConfig = require('./models/settings');
 const journal = require('./models/journal');
 const { gatherSyncFiles } = require('./sync/gather');
 const { createApi } = require('./sync/api');
-const { runSync, summarize } = require('./sync/sync-folder');
+const { runSync, summarize, isSyncInProgress } = require('./sync/sync-folder');
 const setting = require('./setting');
 const packageJson = require('./package.json');
 
@@ -509,7 +509,7 @@ async function syncFolder(folder) {
   }
 
   sendLog(summarize(counts));
-  if (!counts.skipped) {
+  if (!counts.refused && !counts.unreachable) {
     mainWindow.webContents.send('system:update-last-sync', new Date().toLocaleString());
   }
 }
@@ -521,6 +521,13 @@ async function syncFolder(folder) {
  * again, and it re-arms the whole folder at once.
  */
 ipcMain.on('journal:reset', async () => {
+  // Clearing the journal under a running sync leaves that run reading rows
+  // that no longer exist — a TypeError, no statuses sent, files stuck on
+  // "Synchronizing". Refuse rather than race it.
+  if (isSyncInProgress()) {
+    mainWindow.webContents.send('system:log', 'A sync is running. Reset the history when it has finished.');
+    return;
+  }
   const choice = dialog.showMessageBoxSync(mainWindow, {
     type: 'warning',
     buttons: ['Reset history', 'Cancel'],
@@ -530,7 +537,7 @@ ipcMain.on('journal:reset', async () => {
     message: 'Forget every upload result and retry count?',
     detail:
       'Every file in the folder will be checked with the server again on the next sync. ' +
-      'Files already imported are recognised by the server and skipped; files it refused will be tried once more. ' +
+      'Files the server already holds or has refused are recognised and skipped; the rest are uploaded. ' +
       'No files on disk are changed.',
   });
   if (choice !== 0) return;

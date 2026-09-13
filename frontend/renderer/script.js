@@ -367,7 +367,9 @@ $('#reset-history').on('click', function () {
 /** Flip all rows to "Synchronizing" at sync start (row-wise, not a full rebuild). */
 function changeStatusToProcessing() {
   filesDataTable.rows((idx, data) => {
-    if (data[2] === 'Not Synced' || /Synchro/i.test(String(data[2]))) {
+    // Rows that may still change this run: never synced, uploaded and waiting,
+    // or already spinning. Imported and parked rows are settled and stay put.
+    if (/^Not synced|^Uploaded|Synchro/i.test(String(data[2]))) {
       filesDataTable
         .row(idx)
         .data([data[0], data[1], '<i class="fa fa-refresh fa-spin"></i>&nbsp;&nbsp; Synchronizing'])
@@ -432,7 +434,13 @@ ipcRenderer.on('sync:updateStatus', async function (event, data) {
       fs.mkdirSync(targetRootDir);
     }
 
-    if (fs.existsSync(fileResolved)) {
+    // Only a settled file moves: 'Synced' to Archived/, 'Not Synced' to Failed/.
+    // A 'Pending' file — uploaded and waiting for its verdict, or not yet sent
+    // — stays in the folder so the next run can finish with it. Moving it to
+    // Failed/ on a first failed attempt hid it from every later run, which
+    // made the retry the journal counts impossible.
+    const settled = data.status === 'Synced' || data.status === 'Not Synced';
+    if (settled && fs.existsSync(fileResolved)) {
       const relFromRoot = path.relative(rootResolved, fileResolved);
       const parts = relFromRoot.split(path.sep).filter(Boolean); // drop empty parts
 

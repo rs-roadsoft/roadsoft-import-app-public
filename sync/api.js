@@ -29,8 +29,12 @@ const HASH_CHECK_BATCH_SIZE = 1000;
  * refused as "already running": the app stops syncing until it is restarted,
  * silently. Found by pointing the sync at a dead port.
  *
- * The upload gets longer: a 100-file batch is tens of megabytes, and the
- * customer's uplink is what sets the pace (production measured ~0.65 MB/s).
+ * What axios's `timeout` bounds is INACTIVITY on the socket, refreshed on every
+ * chunk written or read — not the total duration of the request. So the upload
+ * value does not have to cover a whole batch: a 700 MiB worst case (100 files at
+ * the server's 7 MiB cap) on a 0.65 MB/s uplink streams for eighteen minutes
+ * and completes, because bytes keep moving. It only has to outlast a stall,
+ * which is why it is still generous.
  */
 const REQUEST_TIMEOUT_MS = 30_000;
 const UPLOAD_TIMEOUT_MS = 5 * 60_000;

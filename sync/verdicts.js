@@ -111,11 +111,6 @@ function fromJobFile(file) {
   }
 }
 
-/** A row that has been tried enough times without ever being imported. */
-function shouldPark(row) {
-  return row.state !== STATE.IMPORTED && row.state !== STATE.PARKED && row.attempts >= MAX_ATTEMPTS;
-}
-
 /** Whether a row is one the sync must never send again. */
 function isTerminal(row) {
   return row.state === STATE.IMPORTED || row.state === STATE.PARKED;
@@ -148,7 +143,6 @@ module.exports = {
   isPermanentCode,
   fromHashCheck,
   fromJobFile,
-  shouldPark,
   isTerminal,
   describe,
 };

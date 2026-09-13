@@ -227,8 +227,9 @@ test('two copies of one file on disk are one upload, and both paths get the stat
 
   assert.equal(api.calls.uploadBatch.length, 1);
   assert.equal(api.calls.uploadBatch[0].length, 1, 'one path sent for two on disk');
-  assert.equal(statuses.get(original.path).status, 'Synced');
-  assert.equal(statuses.get(copy.path).status, 'Synced');
+  // Uploaded and waiting: both copies stay in place until the verdict arrives.
+  assert.equal(statuses.get(original.path).status, 'Pending');
+  assert.equal(statuses.get(copy.path).status, 'Pending');
   assert.equal((await journal.listAll(db)).length, 1);
 });
 
@@ -246,7 +247,7 @@ test('a second trigger while a run is in flight is refused rather than doubled',
   release();
   const firstResult = await first;
 
-  assert.deepEqual(second, { skipped: true });
+  assert.deepEqual(second, { refused: true });
   assert.equal(firstResult.sent, 1);
   assert.equal(api.calls.uploadBatch.length, 1);
 });
@@ -269,6 +270,82 @@ test('a server that cannot be asked postpones the run and counts nothing against
   assert.equal(row.state, STATE.PENDING);
   assert.equal(row.attempts, 0, 'no attempt was charged');
   assert.equal(row.reason_source, null);
+});
+
+test("a file the server already holds from THIS client's own upload stays open until its job answers", async () => {
+  // hash-check answers ALREADY_IMPORTED for a staged or in-flight row too. For
+  // a row this client uploaded and is waiting on, that means "do not send
+  // again" and nothing more — the job poll owns the outcome. Treating it as
+  // final stopped the poll and hid a later retryable failure behind "Imported".
+  const file = writeFile('a.ddd', 'A');
+  const answers = {}; // read at call time, so the answer can change between runs
+  const api = fakeApi({ hashCheck: answers });
+  await run(api); // NOT_IMPORTED -> uploaded, job-1, still WAITING
+
+  answers[file.hash] = 'ALREADY_IMPORTED';
+  await run(api); // hash-check now says ALREADY_IMPORTED for the in-flight row
+
+  const row = await db(journal.JOURNAL).where({ hash: file.hash }).first();
+  assert.equal(row.state, STATE.UPLOADED, 'not marked imported on hash-check alone');
+  assert.deepEqual(await journal.listPendingJobIds(db), ['job-1'], 'the job is still polled');
+  assert.equal(api.calls.uploadBatch.length, 1, 'and it was not re-sent');
+
+  // The job finally answers: THAT is what settles it.
+  api.jobs['job-1'][0] = { hash: file.hash, status: 'DONE', error: {} };
+  await run(api);
+  assert.equal((await db(journal.JOURNAL).where({ hash: file.hash }).first()).state, STATE.IMPORTED);
+});
+
+test('statuses: only settled files are told to move — imported to Archived, parked to Failed, the rest stay', async () => {
+  // Reporting a pending row as 'Not Synced' sent it to Failed/, which the next
+  // scan skips: one failed attempt was final and the retry never had a file.
+  const parked = writeFile('parked.ddd', 'P');
+  const imported = writeFile('imported.ddd', 'I');
+  const waiting = writeFile('waiting.ddd', 'W');
+  const api = fakeApi({ hashCheck: { [parked.hash]: 'PERMANENTLY_FAILED', [imported.hash]: 'ALREADY_IMPORTED' } });
+  const statuses = new Map();
+
+  await run(api, { onFileStatus: (filePath, status) => statuses.set(filePath, status.status) });
+
+  assert.equal(statuses.get(parked.path), 'Not Synced', 'parked -> Failed/');
+  assert.equal(statuses.get(imported.path), 'Synced', 'imported -> Archived/');
+  assert.equal(statuses.get(waiting.path), 'Pending', 'uploaded, waiting -> stays');
+});
+
+test('a file that cannot be read is skipped for this run and does not abort the others', async () => {
+  const good = writeFile('good.ddd', 'G');
+  const ghost = path.join(dir, 'ghost.ddd');
+  const api = fakeApi();
+  const skipped = [];
+  const gatherWithGhost = () => [...gatherSyncFiles(dir), ghost];
+
+  const counts = await runSync({
+    db,
+    api,
+    folder: dir,
+    gather: gatherWithGhost,
+    log: (message) => skipped.push(message),
+  });
+
+  assert.equal(counts.sent, 1);
+  assert.equal(api.calls.uploadBatch[0].length, 1);
+  assert.equal(api.calls.uploadBatch[0][0], good.path);
+  assert.ok(skipped.some((message) => message.includes('ghost.ddd') && message.includes('ENOENT')));
+});
+
+test("a folder larger than SQLite's compound-select cap syncs in one run", async () => {
+  // Every list-taking statement crosses the 500-row cap. Small files, so the
+  // hashing is cheap; the point is the journal's statements, not the bytes.
+  const count = journal.SQLITE_CHUNK * 2 + 77;
+  for (let index = 0; index < count; index += 1) writeFile(`big/${index}.ddd`, `content ${index}`);
+  const api = fakeApi();
+
+  const counts = await run(api);
+
+  assert.equal(counts.total, count);
+  assert.equal(counts.sent, count);
+  assert.equal(api.calls.uploadBatch.length, Math.ceil(count / 100));
+  assert.equal((await journal.listAll(db)).length, count);
 });
 
 test('an empty folder is a no-op that still settles open jobs', async () => {

@@ -17,6 +17,31 @@ const { STATE, REASON_SOURCE } = require('../sync/verdicts');
 const JOURNAL = 'upload_journal';
 const FILE_CACHE = 'file_cache';
 
+/**
+ * Rows per statement, for every multi-row INSERT and every `whereIn`.
+ *
+ * knex compiles a multi-row INSERT for SQLite as `SELECT … UNION ALL SELECT …`,
+ * and the bundled SQLite (3.39.2 in sqlite3 5.0.11, the same library in the
+ * Windows prebuild) is compiled with `MAX_COMPOUND_SELECT=500`: 500 rows insert,
+ * 501 throw `too many terms in compound SELECT`. The production folder this
+ * journal was written for holds 3,716 files, all new to a fresh install — the
+ * first run threw before any hash-check or upload, every hour, and the tests
+ * never went above twelve rows. Found in review.
+ *
+ * The same bound is applied to `whereIn`. The parameter cap is 32,766 here,
+ * but older SQLite builds stop at 999, and a folder is allowed to be larger
+ * than either.
+ */
+const SQLITE_CHUNK = 500;
+
+function chunk(array, size) {
+  const result = [];
+  for (let index = 0; index < array.length; index += size) {
+    result.push(array.slice(index, index + size));
+  }
+  return result;
+}
+
 function now() {
   return new Date().toISOString();
 }
@@ -58,8 +83,12 @@ async function ensureSchema(db) {
 
 async function getByHashes(db, hashes) {
   if (!hashes.length) return new Map();
-  const rows = await db(JOURNAL).whereIn('hash', hashes);
-  return new Map(rows.map((row) => [row.hash, row]));
+  const found = new Map();
+  for (const part of chunk(hashes, SQLITE_CHUNK)) {
+    const rows = await db(JOURNAL).whereIn('hash', part);
+    for (const row of rows) found.set(row.hash, row);
+  }
+  return found;
 }
 
 /**
@@ -85,7 +114,7 @@ async function upsertPending(db, entries) {
       updated_at: stamp,
     }));
   if (fresh.length) {
-    await db(JOURNAL).insert(fresh);
+    await db.batchInsert(JOURNAL, fresh, SQLITE_CHUNK);
   }
   await Promise.all(
     entries
@@ -135,17 +164,19 @@ async function applyVerdict(db, hash, verdict) {
 async function recordTransportFailure(db, hashes, message) {
   if (!hashes.length) return;
   const stamp = now();
-  await db(JOURNAL)
-    .whereIn('hash', hashes)
-    .whereNotIn('state', [STATE.IMPORTED, STATE.PARKED])
-    .update({
-      attempts: db.raw('attempts + 1'),
-      reason_name: null,
-      reason_message: message,
-      reason_source: REASON_SOURCE.TRANSPORT,
-      last_attempt_at: stamp,
-      updated_at: stamp,
-    });
+  for (const part of chunk(hashes, SQLITE_CHUNK)) {
+    await db(JOURNAL)
+      .whereIn('hash', part)
+      .whereNotIn('state', [STATE.IMPORTED, STATE.PARKED])
+      .update({
+        attempts: db.raw('attempts + 1'),
+        reason_name: null,
+        reason_message: message,
+        reason_source: REASON_SOURCE.TRANSPORT,
+        last_attempt_at: stamp,
+        updated_at: stamp,
+      });
+  }
 }
 
 /** Park every row that has used up its attempts without reaching a verdict. */
@@ -183,6 +214,7 @@ async function fileCacheSet(db, entry) {
 module.exports = {
   JOURNAL,
   FILE_CACHE,
+  SQLITE_CHUNK,
   ensureSchema,
   getByHashes,
   upsertPending,

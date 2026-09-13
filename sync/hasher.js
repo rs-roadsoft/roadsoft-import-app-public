@@ -44,10 +44,21 @@ async function hashWithCache(db, filePath) {
  * entry with two paths, so the journal sees one file and the upload sends it
  * once.
  */
-async function hashAll(db, filePaths) {
+async function hashAll(db, filePaths, onUnreadable = () => {}) {
   const byHash = new Map();
   for (const filePath of filePaths) {
-    const hash = await hashWithCache(db, filePath);
+    let hash;
+    try {
+      hash = await hashWithCache(db, filePath);
+    } catch (error) {
+      // A file that cannot be read right now — still being copied in (EBUSY,
+      // EPERM on Windows), or removed by the renderer's unzip pass between the
+      // walk and the read (ENOENT). It is skipped for THIS run and picked up by
+      // the next; without this one locked file aborted the whole run, and kept
+      // aborting it for as long as the lock held.
+      onUnreadable(filePath, error);
+      continue;
+    }
     const entry = byHash.get(hash) ?? { hash, fileName: path.basename(filePath), paths: [] };
     entry.paths.push(filePath);
     byHash.set(hash, entry);

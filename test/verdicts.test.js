@@ -2,7 +2,7 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const verdicts = require('../sync/verdicts');
 
-const { STATE, HASH_CHECK_STATUS, JOB_FILE_STATUS, REASON_SOURCE, MAX_ATTEMPTS } = verdicts;
+const { STATE, HASH_CHECK_STATUS, JOB_FILE_STATUS, REASON_SOURCE } = verdicts;
 
 test('hash-check: ALREADY_IMPORTED and PERMANENTLY_FAILED are terminal, NOT_IMPORTED means upload', () => {
   assert.deepEqual(verdicts.fromHashCheck(HASH_CHECK_STATUS.ALREADY_IMPORTED), {
@@ -76,14 +76,6 @@ test('every permanent code the backend lists is recognised, and nothing else is'
   assert.equal(verdicts.isPermanentCode('max-number-of-drivers-per-vehicles'), false);
   assert.equal(verdicts.isPermanentCode(undefined), false);
   assert.equal(verdicts.isPermanentCode(null), false);
-});
-
-test('shouldPark: only after MAX_ATTEMPTS, and never a row that is already terminal', () => {
-  assert.equal(verdicts.shouldPark({ state: STATE.PENDING, attempts: MAX_ATTEMPTS - 1 }), false);
-  assert.equal(verdicts.shouldPark({ state: STATE.PENDING, attempts: MAX_ATTEMPTS }), true);
-  assert.equal(verdicts.shouldPark({ state: STATE.UPLOADED, attempts: MAX_ATTEMPTS + 5 }), true);
-  assert.equal(verdicts.shouldPark({ state: STATE.IMPORTED, attempts: 99 }), false);
-  assert.equal(verdicts.shouldPark({ state: STATE.PARKED, attempts: 99 }), false);
 });
 
 test('isTerminal: imported and parked are never sent again', () => {

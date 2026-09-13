@@ -153,6 +153,33 @@ test('resetAll empties the journal and the file cache', async () => {
   assert.equal(await journal.fileCacheGet(db, '/x/a.ddd'), undefined);
 });
 
+test("a folder larger than SQLite's compound-select cap goes through every multi-row statement", async () => {
+  // The bundled SQLite is compiled with MAX_COMPOUND_SELECT=500 and knex writes
+  // a multi-row INSERT as SELECT … UNION ALL SELECT …, so 501 rows in one
+  // statement threw. The production folder has 3,716 files, all new to a fresh
+  // install: the first run failed before any hash-check or upload. This crosses
+  // the cap twice over on every statement that takes a list.
+  const count = journal.SQLITE_CHUNK * 2 + 123;
+  const entries = Array.from({ length: count }, (_, index) => ({ hash: `big-${index}`, fileName: `${index}.ddd` }));
+
+  await journal.upsertPending(db, entries);
+  assert.equal((await journal.listAll(db)).length, count);
+
+  const found = await journal.getByHashes(
+    db,
+    entries.map((entry) => entry.hash),
+  );
+  assert.equal(found.size, count);
+
+  await journal.recordTransportFailure(
+    db,
+    entries.map((entry) => entry.hash),
+    'timeout',
+  );
+  const [{ n }] = await db(journal.JOURNAL).where({ attempts: 1 }).count({ n: '*' });
+  assert.equal(Number(n), count);
+});
+
 test('fileCacheSet upserts by path', async () => {
   await journal.fileCacheSet(db, { path: '/x/a.ddd', size: 10, mtime_ms: 1, hash: 'old' });
   await journal.fileCacheSet(db, { path: '/x/a.ddd', size: 11, mtime_ms: 2, hash: 'new' });
