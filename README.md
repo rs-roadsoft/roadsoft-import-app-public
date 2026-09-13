@@ -13,10 +13,20 @@ It provides automatic sync scheduling, local configuration storage (SQLite), and
 - **Auto-unzip archives:** automatically extracts `.zip` files, including **nested zips**  
   — on success the original archive is removed; on failure (e.g., password/corruption) the zip is moved to **Failed** folder
   and any partial files/folders are cleaned up
-- **Smart post-sync handling:**  
+- **Upload journal (v2.2):** every file is identified by the hash of its bytes and recorded in the
+  local database with the server's verdict. Before each upload the app asks the server which files it
+  already has or has permanently refused (`hash-check`), and after each upload it fetches the result
+  of the job. A file the server refused is kept with the server's reason and is **never sent again**;
+  a file that could not be sent (network, server error) is retried on three runs and then parked.
+  Two copies of the same file are one upload. The **Reset history** button forgets every verdict so
+  the whole folder is checked again.
+- **Post-sync folder handling:**  
   — synced files at the root are moved to **Archived**;  
   — if a file came from a subfolder, the **top-level subfolder** is archived as a whole;  
-  — failed items are moved to **Failed**
+  — failed items are moved to **Failed**.  
+  This is a convenience for the person looking at the folder. The journal, not the move, is what
+  prevents a file from being uploaded twice — the move can fail on a synced, locked or network folder
+  and the journal still holds.
 - Supports automatic scheduled sync (every **1h / 12h / 24h** or **on app start**)
 - Local settings stored in **SQLite** database (Company ID, API key, folder, schedule)
 - Minimize to tray and **auto-launch** on system startup

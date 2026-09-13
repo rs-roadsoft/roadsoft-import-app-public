@@ -355,6 +355,11 @@ $('#sync-now').on('click', function () {
   ipcRenderer.send('sync:start');
 });
 
+// The main process asks for confirmation before it clears anything.
+$('#reset-history').on('click', function () {
+  ipcRenderer.send('journal:reset');
+});
+
 /* =========================================================================
    TABLE STATUS UPDATES
    ========================================================================= */
@@ -488,7 +493,12 @@ ipcRenderer.on('sync:updateStatus', async function (event, data) {
     if (rowIndexes && rowIndexes.length > 0) {
       const rowIdx = rowIndexes[0];
       const rowData = filesDataTable.row(rowIdx).data();
-      filesDataTable.row(rowIdx).data([rowData[0], rowData[1], data.status]).draw(false);
+      // `label` is the journal's text — the server's reason when there is one.
+      // `status` stays the move selector above and the fallback here.
+      filesDataTable
+        .row(rowIdx)
+        .data([rowData[0], rowData[1], escapeHtml(data.label ?? data.status)])
+        .draw(false);
     }
   }
 });
