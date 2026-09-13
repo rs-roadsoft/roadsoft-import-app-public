@@ -463,36 +463,24 @@ ipcRenderer.on('sync:updateStatus', async function (event, data) {
           addLog(`[Guard] Refuse to move top-level file outside target dir: ${destFilePath}`);
         }
       } else {
-        // File is inside a subfolder: move entire top-level folder
-        const topLevelFolderName = parts[0];
-
-        // Guard 3: first segment cannot be "." or ".." and must be a plain name
-        if (!topLevelFolderName || topLevelFolderName === '.' || topLevelFolderName === '..') {
-          addLog(`[Guard] Invalid top-level name for move: "${topLevelFolderName}" from ${relFromRoot}`);
+        // A file inside a subfolder moves ALONE, keeping its relative path —
+        // never its whole top-level folder. Moving the folder on the first
+        // settled file took every pending sibling out of the scan with it:
+        // their retries never happened, a FAILED-retryable sibling was polled
+        // for ever, and a parked sibling could land in Archived/. The source
+        // folder stays where it is, even once it is empty.
+        const destFilePath = path.join(targetRootDir, relFromRoot);
+        if (!isPathInside(targetRootDir, destFilePath)) {
+          addLog(`[Guard] Refuse to move file outside target dir: ${destFilePath}`);
         } else {
-          const srcTopFolderPath = path.join(rootResolved, topLevelFolderName);
-          const destTopFolderPath = path.join(targetRootDir, topLevelFolderName);
-
-          // Guard 4: both src and dest must be inside root / targetRootDir respectively
-          const srcOk =
-            isPathInside(rootResolved, srcTopFolderPath) || realResolve(srcTopFolderPath) === realResolve(rootResolved);
-          const dstOk =
-            isPathInside(targetRootDir, destTopFolderPath) ||
-            realResolve(destTopFolderPath) === realResolve(targetRootDir);
-
-          if (srcOk && dstOk && fs.existsSync(srcTopFolderPath)) {
-            if (fs.existsSync(destTopFolderPath)) {
-              await removePathRecursiveSyncSafe(destTopFolderPath, rootResolved);
-            }
-            try {
-              await fs.promises.rename(srcTopFolderPath, destTopFolderPath);
-            } catch (err) {
-              addLog(`Error moving folder: ${err?.message}`);
-            }
-          } else {
-            addLog(
-              `[Guard] Refuse to move folder. srcOk=${srcOk} dstOk=${dstOk} src=${srcTopFolderPath} dst=${destTopFolderPath}`,
-            );
+          fs.mkdirSync(path.dirname(destFilePath), { recursive: true });
+          if (fs.existsSync(destFilePath)) {
+            await removePathRecursiveSyncSafe(destFilePath, rootResolved);
+          }
+          try {
+            await fs.promises.rename(fileResolved, destFilePath);
+          } catch (err) {
+            addLog(`Error moving file: ${err?.message}`);
           }
         }
       }

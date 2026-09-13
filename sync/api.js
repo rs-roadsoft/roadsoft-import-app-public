@@ -15,6 +15,14 @@ const BULK_BATCH_SIZE = 100;
 /** Hashes per hash-check request — the server's `MAX_IMPORT_HASH_CHECK_BATCH`. */
 const HASH_CHECK_BATCH_SIZE = 1000;
 /**
+ * The largest single file the server accepts in a multipart request — its
+ * `MAX_BUFFERED_FILE_BYTES`, the parser's 6 MiB limit plus one MiB of slack.
+ * Multer refuses the WHOLE request with 413 when one file is over it, so a
+ * file this size is never sent: it is parked locally, with the reason, before
+ * it can poison the ninety-nine files batched beside it.
+ */
+const MAX_UPLOAD_FILE_BYTES = 7 * 1024 * 1024;
+/**
  * There is deliberately no "queue full, wait and retry" loop here. Earlier
  * builds retried up to twenty times on a `too-many-files-in-queue` answer; the
  * backend retired that code in RS-6709 — an upload over the company's intake
@@ -96,6 +104,21 @@ function createApi({ baseUrl, companyIdentifier, apiKey, headers }) {
   return { hashCheck, uploadBatch, getJobFiles };
 }
 
+/**
+ * The request never got an answer: a refused connection, a reset, a timeout, a
+ * DNS miss. That is a fact about the network, not about any file, and it is
+ * charged to nothing. An HTTP error IS an answer, and is charged to the batch
+ * that drew it.
+ */
+function isTransportError(error) {
+  return !error?.response;
+}
+
+/** The whole multipart request was refused for its size — one file in it does not fit. */
+function isPayloadTooLarge(error) {
+  return error?.response?.status === 413;
+}
+
 /** A readable one-liner for a failed request, for the journal and the log. */
 function describeError(error) {
   const status = error.response?.status;
@@ -107,6 +130,9 @@ function describeError(error) {
 module.exports = {
   BULK_BATCH_SIZE,
   HASH_CHECK_BATCH_SIZE,
+  MAX_UPLOAD_FILE_BYTES,
   createApi,
   describeError,
+  isPayloadTooLarge,
+  isTransportError,
 };

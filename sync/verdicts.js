@@ -116,6 +116,17 @@ function isTerminal(row) {
   return row.state === STATE.IMPORTED || row.state === STATE.PARKED;
 }
 
+/**
+ * Uploaded and still waiting for the server's verdict. Such a row is not a
+ * failed attempt — the server may be importing it right now — so it is neither
+ * parked by the attempt cap nor re-sent because a hash-check calls the same
+ * bytes ALREADY_IMPORTED (a staged or in-flight row answers that way too).
+ */
+function isInFlight(row) {
+  if (row?.state !== STATE.UPLOADED) return false;
+  return row.verdict === null || row.verdict === undefined || row.verdict === JOB_FILE_STATUS.WAITING;
+}
+
 /** The status text the file table shows for a row. */
 function describe(row) {
   // A backend reason has a code and a message; a transport failure has only a
@@ -134,6 +145,7 @@ function describe(row) {
 }
 
 module.exports = {
+  isInFlight,
   STATE,
   HASH_CHECK_STATUS,
   JOB_FILE_STATUS,

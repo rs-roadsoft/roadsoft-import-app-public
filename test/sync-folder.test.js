@@ -53,7 +53,9 @@ function fakeApi({ hashCheck = {}, jobs = {}, uploadError = null } = {}) {
     },
     uploadBatch: async (paths) => {
       calls.uploadBatch.push(paths);
-      if (uploadError) throw uploadError;
+      // A fixed error, or a script: `(paths, callIndex) => error | null`.
+      const error = typeof uploadError === 'function' ? uploadError(paths, calls.uploadBatch.length) : uploadError;
+      if (error) throw error;
       jobCounter += 1;
       const jobId = `job-${jobCounter}`;
       const files = paths.map((filePath, index) => ({
@@ -191,9 +193,14 @@ test('open jobs are settled at the START of the next run, before anything is sen
   assert.equal(row.reason_name, 'file-upload/upload-not-allowed/already-exists');
 });
 
-test('a transport failure is counted per file and parks after MAX_ATTEMPTS runs', async () => {
+test('a request the server answered with an error is counted per file and parks after MAX_ATTEMPTS runs', async () => {
+  // An HTTP error IS an answer — the batch reached the server and was refused —
+  // so it is charged. A request that got no answer at all is the other case,
+  // tested below: charged to nothing.
   const file = writeFile('a.ddd', 'A');
-  const error = Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:3029'), { code: 'ECONNREFUSED' });
+  const error = Object.assign(new Error('Request failed with status code 500'), {
+    response: { status: 500, data: { message: 'Internal server error' } },
+  });
   const api = fakeApi({ uploadError: error });
 
   for (let attempt = 1; attempt < MAX_ATTEMPTS; attempt += 1) {
@@ -209,7 +216,7 @@ test('a transport failure is counted per file and parks after MAX_ATTEMPTS runs'
   const parked = await db(journal.JOURNAL).where({ hash: file.hash }).first();
   assert.equal(parked.state, STATE.PARKED);
   assert.equal(parked.attempts, MAX_ATTEMPTS);
-  assert.equal(parked.reason_message, 'connect ECONNREFUSED 127.0.0.1:3029');
+  assert.equal(parked.reason_message, 'HTTP 500 Internal server error');
 
   // Parked: the next run neither asks nor sends.
   const before = api.calls.uploadBatch.length;
@@ -353,4 +360,147 @@ test('an empty folder is a no-op that still settles open jobs', async () => {
   const counts = await run(api);
   assert.deepEqual(counts, { total: 0, sent: 0, skipped: 0, failed: 0 });
   assert.equal(api.calls.hashCheck.length, 0);
+});
+
+// --- Errors the fake server answers with, in the shapes axios produces. ---
+const transportError = () => Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' });
+const httpError = (status, message = `Request failed with status code ${status}`) =>
+  Object.assign(new Error(message), { response: { status, data: { message } } });
+const retryableFailure = (hash) => ({
+  hash,
+  status: 'FAILED',
+  error: { name: 'max-number-of-drivers-per-vehicles', message: 'Maximum number of drivers reached' },
+});
+const rowOf = (hash) => db(journal.JOURNAL).where({ hash }).first();
+
+test('a poll of an old job cannot un-park a file, so MAX_ATTEMPTS holds and the re-upload loop ends', async () => {
+  // The production shape that defeated the first version: one file the server
+  // never settles keeps its job open for ever, and a sibling in the same job
+  // keeps failing with a RETRYABLE code. Every hourly poll of that old job
+  // reported the sibling FAILED again — which moved a parked row back to
+  // uploaded, and the next hash-check sent it. Eight uploads in eight runs.
+  const waiting = writeFile('waiting.ddd', 'W');
+  const flaky = writeFile('flaky.ddd', 'F');
+  const hashCheck = {};
+  const api = fakeApi({ hashCheck });
+  const scriptedGetJobFiles = api.getJobFiles;
+  api.getJobFiles = async (jobId) =>
+    (await scriptedGetJobFiles(jobId)).map((file) => (file.hash === flaky.hash ? retryableFailure(file.hash) : file));
+
+  // Run 1 uploads both under job-1. From then on the server holds `waiting`
+  // staged, and answers ALREADY_IMPORTED for it — which is what keeps job-1
+  // open and polled on every later run.
+  await run(api);
+  hashCheck[waiting.hash] = 'ALREADY_IMPORTED';
+  for (let pass = 1; pass < 8; pass += 1) await run(api);
+
+  const row = await rowOf(flaky.hash);
+  assert.equal(row.state, STATE.PARKED);
+  assert.equal(row.attempts, MAX_ATTEMPTS);
+  const flakyUploads = api.calls.uploadBatch.filter((paths) => paths.includes(flaky.path)).length;
+  assert.equal(flakyUploads, MAX_ATTEMPTS, 'uploaded exactly MAX_ATTEMPTS times, then never again');
+  // ...while the file that is genuinely waiting is neither parked nor re-sent.
+  const waitingRow = await rowOf(waiting.hash);
+  assert.equal(waitingRow.state, STATE.UPLOADED);
+  assert.equal(api.calls.uploadBatch.filter((paths) => paths.includes(waiting.path)).length, 1);
+});
+
+test('the attempt cap never parks an upload that reached the server', async () => {
+  // Attempts count every upload, successful ones included. Two answered
+  // failures and then a success is three attempts — and the third one is a
+  // job the server is working on. Parking it moved the file to Failed/ while
+  // the server imported it.
+  const file = writeFile('third-time.ddd', 'T');
+  const statuses = [];
+  const api = fakeApi({ uploadError: (paths, callIndex) => (callIndex <= 2 ? httpError(500) : null) });
+
+  await run(api, { onFileStatus: (_, { status }) => statuses.push(status) });
+  await run(api, { onFileStatus: (_, { status }) => statuses.push(status) });
+  await run(api, { onFileStatus: (_, { status }) => statuses.push(status) });
+
+  const row = await rowOf(file.hash);
+  assert.equal(row.attempts, MAX_ATTEMPTS);
+  assert.equal(row.state, STATE.UPLOADED);
+  assert.equal(row.verdict, 'WAITING');
+  assert.equal(statuses.at(-1), 'Pending', 'not reported as Not Synced, so the renderer leaves the file in place');
+  assert.equal(api.calls.uploadBatch.length, 3);
+});
+
+test('a network drop during upload charges nothing and postpones the remaining batches', async () => {
+  // 101 files: two batches. The first never reaches the server. The hash-check
+  // path already treated an unreachable server as "no verdict on anything";
+  // the upload path charged every file behind the drop, and three such runs
+  // parked a whole folder.
+  const files = Array.from({ length: 101 }, (_, index) =>
+    writeFile(`f${String(index).padStart(3, '0')}.ddd`, `F${index}`),
+  );
+  const api = fakeApi({ uploadError: () => transportError() });
+
+  const counts = await run(api);
+
+  assert.equal(counts.unreachable, true);
+  assert.equal(api.calls.uploadBatch.length, 1, 'the second batch is not attempted');
+  const rows = await db(journal.JOURNAL).select('state', 'attempts');
+  assert.equal(rows.length, files.length);
+  assert.ok(
+    rows.every((row) => row.state === STATE.PENDING && row.attempts === 0),
+    'no file is charged',
+  );
+});
+
+test('a file whose own job failed retryably is settled by a later ALREADY_IMPORTED', async () => {
+  // The server holds a good copy of these bytes from elsewhere. That used to
+  // be ignored for ever because the row "belonged to its job" — which had
+  // already answered. Polled every run, never settled.
+  const file = writeFile('elsewhere.ddd', 'E');
+  const hashCheck = {};
+  const api = fakeApi({ hashCheck });
+  const scriptedGetJobFiles = api.getJobFiles;
+  api.getJobFiles = async (jobId) => (await scriptedGetJobFiles(jobId)).map((one) => retryableFailure(one.hash));
+
+  await run(api);
+  assert.equal((await rowOf(file.hash)).state, STATE.UPLOADED);
+
+  hashCheck[file.hash] = 'ALREADY_IMPORTED';
+  await run(api);
+
+  const row = await rowOf(file.hash);
+  assert.equal(row.state, STATE.IMPORTED);
+  assert.equal(api.calls.uploadBatch.length, 1, 'not sent again');
+});
+
+test('a batch refused for its size is re-sent one file at a time, and only the oversized file is parked', async () => {
+  const good = writeFile('good.ddd', 'G');
+  const big = writeFile('big.ddd', 'B');
+  const other = writeFile('other.ddd', 'O');
+  const api = fakeApi({
+    uploadError: (paths) => (paths.length > 1 || paths[0] === big.path ? httpError(413, 'Payload too large') : null),
+  });
+
+  await run(api);
+
+  assert.equal((await rowOf(big.hash)).state, STATE.PARKED);
+  assert.match((await rowOf(big.hash)).reason_message, /HTTP 413/);
+  assert.equal((await rowOf(good.hash)).state, STATE.UPLOADED);
+  assert.equal((await rowOf(other.hash)).state, STATE.UPLOADED);
+  // One refused batch, then one request per file.
+  assert.equal(api.calls.uploadBatch.length, 4);
+});
+
+test('a file larger than the server accepts is parked locally and never sent', async () => {
+  const { MAX_UPLOAD_FILE_BYTES } = require('../sync/api');
+  const huge = writeFile('huge.ddd', Buffer.alloc(MAX_UPLOAD_FILE_BYTES + 1, 1));
+  const small = writeFile('small.ddd', 'S');
+  const api = fakeApi();
+
+  await run(api);
+
+  const row = await rowOf(huge.hash);
+  assert.equal(row.state, STATE.PARKED);
+  assert.match(row.reason_message, /server accepts at most 7 MiB/);
+  assert.ok(
+    api.calls.uploadBatch.every((paths) => !paths.includes(huge.path)),
+    'never uploaded',
+  );
+  assert.equal((await rowOf(small.hash)).state, STATE.UPLOADED);
 });

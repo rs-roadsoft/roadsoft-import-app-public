@@ -13,7 +13,7 @@
  * logger, the API and the status callback, which is what lets the whole flow
  * run under `node --test` against a temp folder and a fake server.
  */
-const { BULK_BATCH_SIZE, describeError } = require('./api');
+const { BULK_BATCH_SIZE, MAX_UPLOAD_FILE_BYTES, describeError, isPayloadTooLarge, isTransportError } = require('./api');
 const hasher = require('./hasher');
 const journal = require('../models/journal');
 const verdicts = require('./verdicts');
@@ -44,23 +44,29 @@ function isSyncInProgress() {
 async function settleOpenJobs({ db, api, log }) {
   const jobIds = await journal.listPendingJobIds(db);
   for (const jobId of jobIds) {
-    try {
-      const files = await api.getJobFiles(jobId);
-      for (const file of files) {
-        if (!file?.hash) continue;
-        await journal.applyVerdict(db, file.hash, verdicts.fromJobFile(file));
-      }
-    } catch (error) {
-      log(`Could not fetch verdicts for job ${jobId}: ${describeError(error)}`);
-    }
+    await settleJob({ db, api, log }, jobId);
   }
 }
 
 /**
- * Upload one batch and record the outcome — the receipt on success, a transport
- * failure for every file otherwise. Then poll the job once: intake refusals
- * are final immediately, and this is what puts their reason in the journal
- * without waiting an hour.
+ * Upload one batch and record the outcome. Then poll the job once: intake
+ * refusals are final immediately, and this is what puts their reason in the
+ * journal without waiting an hour.
+ *
+ * Three outcomes, charged differently:
+ *
+ * - The server answered with a receipt: every file is `uploaded` under the job.
+ * - The server answered with an error: the batch is charged an attempt. One
+ *   answer is special — 413, the whole request refused for its size. That is
+ *   one oversized file poisoning its ninety-nine neighbours, and because the
+ *   batches are deterministic it would poison them on every run until they all
+ *   parked. So the batch is re-sent one file at a time, and only the file that
+ *   is refused alone is parked.
+ * - The server did not answer at all: nothing is charged, and the run stops
+ *   sending. A network drop halfway through a folder used to charge every file
+ *   behind it, three of those parked the whole folder, and the renderer moved
+ *   it to `Failed/`. The hash-check path already treated an unreachable server
+ *   this way; the upload path did not.
  */
 async function uploadOne({ db, api, log }, entries) {
   const paths = entries.map((entry) => entry.paths[0]);
@@ -79,18 +85,48 @@ async function uploadOne({ db, api, log }, entries) {
     return { sent: entries.length, failed: 0 };
   } catch (error) {
     const reason = describeError(error);
+    if (isTransportError(error)) {
+      log(`Server unreachable while uploading, sync postponed: ${reason}`);
+      return { sent: 0, failed: 0, unreachable: true };
+    }
+    if (isPayloadTooLarge(error) && entries.length > 1) {
+      log(`Batch refused for its size (${reason}); sending its ${entries.length} files one at a time`);
+      const outcomes = [];
+      for (const entry of entries) {
+        outcomes.push(await uploadOne({ db, api, log }, [entry]));
+      }
+      return outcomes.reduce(
+        (total, one) => ({
+          sent: total.sent + one.sent,
+          failed: total.failed + one.failed,
+          unreachable: total.unreachable || !!one.unreachable,
+        }),
+        { sent: 0, failed: 0, unreachable: false },
+      );
+    }
+    if (isPayloadTooLarge(error)) {
+      log(`File refused for its size, parked: ${entries[0].fileName} (${reason})`);
+      await journal.parkRefusedUpload(db, hashes[0], reason);
+      return { sent: 0, failed: 1 };
+    }
     log(`Batch failed: ${reason}`);
     await journal.recordTransportFailure(db, hashes, reason);
     return { sent: 0, failed: entries.length };
   }
 }
 
+/**
+ * Write down what one job says about its files — and only about ITS files:
+ * the verdict is applied where the row's `job_id` matches, so a stale job
+ * cannot speak over a newer one. Best-effort; a failed poll is asked again next
+ * run.
+ */
 async function settleJob({ db, api, log }, jobId) {
   try {
     const files = await api.getJobFiles(jobId);
     for (const file of files) {
       if (!file?.hash) continue;
-      await journal.applyVerdict(db, file.hash, verdicts.fromJobFile(file));
+      await journal.applyVerdict(db, file.hash, verdicts.fromJobFile(file), { jobId });
     }
   } catch (error) {
     log(`Could not fetch verdicts for job ${jobId}: ${describeError(error)}`);
@@ -116,6 +152,11 @@ async function runSync({ db, api, folder, gather, log, onFileStatus = () => {} }
   syncInProgress = true;
   try {
     await settleOpenJobs({ db, api, log });
+    // A row whose LAST attempt came back retryable-FAILED has now used up its
+    // attempts — park it here, before the hash-check below would send it once
+    // more. The end-of-run call cannot do this: by then the extra upload has
+    // happened.
+    await journal.parkExhausted(db, MAX_ATTEMPTS);
 
     const filePaths = gather(folder);
     if (!filePaths.length) {
@@ -123,10 +164,29 @@ async function runSync({ db, api, folder, gather, log, onFileStatus = () => {} }
       return { total: 0, sent: 0, skipped: 0, failed: 0 };
     }
 
-    const entries = await hasher.hashAll(db, filePaths, (filePath, error) =>
-      log(`Skipped this run, could not read ${filePath}: ${error.code ?? error.message}`),
-    );
+    const unreadable = [];
+    const entries = await hasher.hashAll(db, filePaths, (filePath, error) => {
+      const why = error.code ?? error.message;
+      log(`Skipped this run, could not read ${filePath}: ${why}`);
+      unreadable.push({ filePath, label: `Skipped this run: ${why}` });
+    });
+    // Told to the table now, or the row sits on "Synchronizing" until the next
+    // run — a file still being copied in looks like a hung sync.
+    for (const { filePath, label } of unreadable) {
+      onFileStatus(filePath, { status: 'Pending', label });
+    }
     await journal.upsertPending(db, entries);
+    // Parked here, not by the server: a file over the per-file limit is refused
+    // as a whole request (413), which would take its batch down with it.
+    for (const entry of entries.filter((one) => one.size > MAX_UPLOAD_FILE_BYTES)) {
+      const mib = (entry.size / (1024 * 1024)).toFixed(1);
+      log(`Parked, larger than the server accepts: ${entry.fileName} (${mib} MiB)`);
+      await journal.parkRefusedUpload(
+        db,
+        entry.hash,
+        `File is ${mib} MiB; the server accepts at most ${MAX_UPLOAD_FILE_BYTES / (1024 * 1024)} MiB per file`,
+      );
+    }
     const rows = await journal.getByHashes(
       db,
       entries.map((entry) => entry.hash),
@@ -161,8 +221,14 @@ async function runSync({ db, api, folder, gather, log, onFileStatus = () => {} }
       // not send again" and nothing more. The outcome belongs to the job poll.
       // Recording it as imported here made the row terminal, stopped the poll,
       // and hid a later retryable failure behind an "Imported" label.
+      //
+      // Only while it IS still waiting. Once its own job has answered FAILED
+      // with a retryable code, the row is no longer waiting on anything, and an
+      // ALREADY_IMPORTED then means the server holds a good copy of these bytes
+      // from elsewhere — which is the verdict. Without this distinction such a
+      // row was skipped on every run for ever, polled and never settled.
       const row = rows.get(entry.hash);
-      const awaitingOwnJob = row?.state === STATE.UPLOADED && !!row.job_id;
+      const awaitingOwnJob = verdicts.isInFlight(row) && !!row.job_id;
       if (awaitingOwnJob && verdict.state === STATE.IMPORTED) {
         continue;
       }
@@ -175,9 +241,20 @@ async function runSync({ db, api, folder, gather, log, onFileStatus = () => {} }
       const outcome = await uploadOne({ db, api, log }, batch);
       counts.sent += outcome.sent;
       counts.failed += outcome.failed;
+      if (outcome.unreachable) {
+        // Nothing behind this batch is charged either. The files keep their
+        // rows exactly as they were and the next run sends them.
+        counts.unreachable = true;
+        log(
+          `Batch ${index + 1}/${batches.length} could not reach the server; ${batches.length - index - 1} batch(es) left for the next run`,
+        );
+        break;
+      }
       log(`Batch ${index + 1}/${batches.length} complete`);
     }
 
+    // The rows that never got an upload, or whose upload this run came back
+    // retryable-FAILED. An upload still waiting on its verdict is not touched.
     await journal.parkExhausted(db, MAX_ATTEMPTS);
 
     const finalRows = await journal.getByHashes(

@@ -27,15 +27,28 @@ function hashFile(filePath) {
   });
 }
 
-async function hashWithCache(db, filePath) {
+/**
+ * The cache key is `(size, mtime rounded to the millisecond)`. On NTFS that is
+ * exact. On a FAT/exFAT stick the file system stores mtime at two-second
+ * resolution, so a file rewritten to the SAME size within two seconds of its
+ * previous write is served from the cache under its old hash. Accepted: it
+ * needs a same-size rewrite inside that window, and the next change of either
+ * value re-hashes. `file_cache` rows for files that no longer exist are not
+ * pruned; a Reset clears them.
+ */
+async function hashWithCacheAndSize(db, filePath) {
   const stat = await fs.promises.stat(filePath);
   const cached = await journal.fileCacheGet(db, filePath);
   if (cached && cached.size === stat.size && Number(cached.mtime_ms) === Math.floor(stat.mtimeMs)) {
-    return cached.hash;
+    return { hash: cached.hash, size: stat.size };
   }
   const hash = await hashFile(filePath);
   await journal.fileCacheSet(db, { path: filePath, size: stat.size, mtime_ms: Math.floor(stat.mtimeMs), hash });
-  return hash;
+  return { hash, size: stat.size };
+}
+
+async function hashWithCache(db, filePath) {
+  return (await hashWithCacheAndSize(db, filePath)).hash;
 }
 
 /**
@@ -48,8 +61,9 @@ async function hashAll(db, filePaths, onUnreadable = () => {}) {
   const byHash = new Map();
   for (const filePath of filePaths) {
     let hash;
+    let size;
     try {
-      hash = await hashWithCache(db, filePath);
+      ({ hash, size } = await hashWithCacheAndSize(db, filePath));
     } catch (error) {
       // A file that cannot be read right now — still being copied in (EBUSY,
       // EPERM on Windows), or removed by the renderer's unzip pass between the
@@ -59,7 +73,7 @@ async function hashAll(db, filePaths, onUnreadable = () => {}) {
       onUnreadable(filePath, error);
       continue;
     }
-    const entry = byHash.get(hash) ?? { hash, fileName: path.basename(filePath), paths: [] };
+    const entry = byHash.get(hash) ?? { hash, fileName: path.basename(filePath), size, paths: [] };
     entry.paths.push(filePath);
     byHash.set(hash, entry);
   }

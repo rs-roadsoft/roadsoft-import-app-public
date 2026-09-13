@@ -1,0 +1,26 @@
+name: Tests
+
+# The only thing that runs the suite automatically. Until this existed the 38
+# tests on the journal branch ran only when somebody typed `npm test`, and the
+# review that found two loop-reproducing defects had to check the branch out to
+# find them. `node --test` with a glob argument needs Node 21 or newer, which is
+# why `engines` and this runner both say so.
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      # `--ignore-scripts` skips electron's postinstall download; sqlite3 then
+      # needs its native binding rebuilt for the runner's Node.
+      - run: npm ci --ignore-scripts
+      - run: npm rebuild sqlite3
+      - run: npm test

@@ -12,7 +12,7 @@
  * Every function takes the knex instance, so the tests run against `:memory:`
  * and the app passes its real connection.
  */
-const { STATE, REASON_SOURCE } = require('../sync/verdicts');
+const { STATE, REASON_SOURCE, JOB_FILE_STATUS } = require('../sync/verdicts');
 
 const JOURNAL = 'upload_journal';
 const FILE_CACHE = 'file_cache';
@@ -50,6 +50,11 @@ function now() {
  * Create both tables if they are missing. Idempotent, and called on every
  * start: the packaged app copies `app/config.db` into `userData` ONCE, so a
  * knex migration or a new template would never reach an existing install.
+ *
+ * `hasTable` is enough only while the shape never changes. A column added
+ * later would never reach an installed machine, because the table already
+ * exists there. When the schema changes, check `hasColumn` per new column and
+ * `alterTable` it in, here, on the same start-up path.
  */
 async function ensureSchema(db) {
   if (!(await db.schema.hasTable(JOURNAL))) {
@@ -123,7 +128,14 @@ async function upsertPending(db, entries) {
   );
 }
 
-/** The batch left the client: record the job and count the attempt. */
+/**
+ * The batch left the client: record the job and count the attempt.
+ *
+ * The verdict and the reason are cleared, not carried over. A row that keeps a
+ * `FAILED` verdict from its previous job while this one is still in flight
+ * reads as failed to the attempt cap, and was parked — with the file moved to
+ * `Failed/` — while the server was importing it.
+ */
 async function markUploaded(db, receipts, jobId) {
   const stamp = now();
   await Promise.all(
@@ -132,6 +144,10 @@ async function markUploaded(db, receipts, jobId) {
         .where({ hash: receipt.hash })
         .update({
           state: STATE.UPLOADED,
+          verdict: null,
+          reason_name: null,
+          reason_message: null,
+          reason_source: null,
           job_id: jobId,
           import_id: receipt.importId ?? null,
           attempts: db.raw('attempts + 1'),
@@ -143,10 +159,22 @@ async function markUploaded(db, receipts, jobId) {
 }
 
 /**
- * Write what the server said. `imported` is final: a later poll of an older
- * job, or a stale hash-check, must not move a row back out of it.
+ * Write what the server said.
+ *
+ * Two rules keep a row from going round again, and both were missing once:
+ *
+ * - A terminal row never leaves its state for a non-terminal verdict.
+ *   `imported` is final for everything; `parked` is final for a WAITING or a
+ *   retryable-FAILED verdict. Without the second half, a poll of an OLD job —
+ *   kept open by any file still WAITING in it — reported a parked file as
+ *   FAILED again, moved it back to `uploaded`, and the next hash-check sent it.
+ *   Eight uploads in eight runs, with the attempt cap never reached. That is
+ *   the loop this journal exists to end.
+ * - A job poll speaks only for the rows that job owns. Pass `jobId` and the
+ *   verdict is applied only where `job_id` matches, so an old job cannot
+ *   overwrite what a newer one has already said about the same bytes.
  */
-async function applyVerdict(db, hash, verdict) {
+async function applyVerdict(db, hash, verdict, { jobId } = {}) {
   const patch = {
     state: verdict.state,
     verdict: verdict.verdict ?? null,
@@ -157,7 +185,25 @@ async function applyVerdict(db, hash, verdict) {
     patch.reason_message = verdict.reasonMessage ?? null;
     patch.reason_source = verdict.reasonSource ?? REASON_SOURCE.BACKEND;
   }
-  await db(JOURNAL).where({ hash }).whereNot({ state: STATE.IMPORTED }).update(patch);
+  const blocked = verdict.state === STATE.UPLOADED ? [STATE.IMPORTED, STATE.PARKED] : [STATE.IMPORTED];
+  let query = db(JOURNAL).where({ hash }).whereNotIn('state', blocked);
+  if (jobId) query = query.where({ job_id: jobId });
+  await query.update(patch);
+}
+
+/**
+ * A single file the server refuses to accept at all — too large for one
+ * request. Final for those bytes, with the HTTP answer as the reason.
+ */
+async function parkRefusedUpload(db, hash, message) {
+  await db(JOURNAL).where({ hash }).whereNotIn('state', [STATE.IMPORTED]).update({
+    state: STATE.PARKED,
+    verdict: null,
+    reason_name: null,
+    reason_message: message,
+    reason_source: REASON_SOURCE.TRANSPORT,
+    updated_at: now(),
+  });
 }
 
 /** The request itself failed; the file was not judged. */
@@ -179,11 +225,22 @@ async function recordTransportFailure(db, hashes, message) {
   }
 }
 
-/** Park every row that has used up its attempts without reaching a verdict. */
+/**
+ * Park every row that has used up its attempts and is not in flight.
+ *
+ * "Not in flight" is the half that was missing. `attempts` counts every upload,
+ * successful ones included, so a third attempt that REACHED the server — job
+ * WAITING, or no verdict yet — was parked in the same run, the renderer moved
+ * the file to `Failed/`, the job was never polled again, and the server may well
+ * have imported it. Only a row that holds a retryable FAILED verdict, or one
+ * that never got as far as an upload, has actually exhausted anything.
+ */
 async function parkExhausted(db, maxAttempts) {
   await db(JOURNAL)
-    .whereNotIn('state', [STATE.IMPORTED, STATE.PARKED])
     .where('attempts', '>=', maxAttempts)
+    .andWhere((query) =>
+      query.where({ state: STATE.PENDING }).orWhere({ state: STATE.UPLOADED, verdict: JOB_FILE_STATUS.FAILED }),
+    )
     .update({ state: STATE.PARKED, updated_at: now() });
 }
 
@@ -220,6 +277,7 @@ module.exports = {
   upsertPending,
   markUploaded,
   applyVerdict,
+  parkRefusedUpload,
   recordTransportFailure,
   parkExhausted,
   listPendingJobIds,

@@ -159,7 +159,14 @@ app.whenReady().then(async () => {
   // Nothing runs knex migrations in this app: the packaged build copies
   // `app/config.db` into userData once, so an existing install never sees a
   // new template. Idempotent, and cheap on every later start.
-  await journal.ensureSchema(dbConfig.db);
+  try {
+    await journal.ensureSchema(dbConfig.db);
+  } catch (error) {
+    // Without the journal a sync cannot run, but a start-up that dies here
+    // shows nothing at all — no window, no tray, no log line. Show the window
+    // and say so; the sync will report the same failure where it can be read.
+    log.error('Could not prepare the upload journal:', error);
+  }
 
   // Load auto-start preferences from DB
   const autoStartEnabled = await dbConfig.getSetting('auto_start_enabled');
@@ -359,12 +366,23 @@ async function connect(company_id, api_key) {
       'API-KEY': api_key,
       ...getCustomHeaders(),
     },
+    // Every request is bounded — see `sync/api.js`. This one was not, and it
+    // is awaited before the scheduler is armed: a half-open connection at
+    // start-up meant no hourly sync until the app was restarted.
+    timeout: 30_000,
   };
 
   try {
     const response = await axios(config);
 
     if (response) {
+      // The journal's verdicts belong to ONE company. Pointed at another, an
+      // `imported` row would keep a file from ever reaching the new company,
+      // and old job ids would be polled against it every run. Start over.
+      if (companyIdentifier && companyIdentifier !== company_id) {
+        await journal.resetAll(dbConfig.db);
+        log.info(`Company changed from ${companyIdentifier} to ${company_id}; upload history reset`);
+      }
       apiKey = api_key;
       companyIdentifier = company_id;
       dbConfig.setSetting('api_key', apiKey);
@@ -440,15 +458,17 @@ ipcMain.on('sync:start', async () => {
 });
 
 /* ===================================== SYNC LOGIC (updated) ===================================== */
-function logFileResult(file, success, errorMessage = '') {
+function logFileResult(file, status, label = '') {
   const logFilePath = path.join(app.getPath('userData'), 'log.txt');
 
   if (!fs.existsSync(logFilePath)) {
     fs.writeFileSync(logFilePath, '', { flag: 'w' });
   }
 
-  const status = success ? 'Success' : `Failed: ${errorMessage}`;
-  fs.appendFileSync(logFilePath, `[${new Date().toLocaleString()}] (${status}) ${path.basename(file)}\n`);
+  // Three outcomes, like the table. A pending file used to be logged as
+  // "Failed: Uploaded — waiting for verdict", which is not what happened to it.
+  const line = status === 'Synced' ? 'Success' : status === 'Not Synced' ? `Failed: ${label}` : `Pending: ${label}`;
+  fs.appendFileSync(logFilePath, `[${new Date().toLocaleString()}] (${line}) ${path.basename(file)}\n`);
 }
 
 /**
@@ -469,6 +489,14 @@ async function syncFolder(folder) {
 
   if (!fs.existsSync(folder)) {
     mainWindow.webContents.send('system:log', `Error: Selected folder does not exist: ${folder}`);
+    return;
+  }
+
+  // Refused up front, before the table rebuild, the unzip pass, the spinner
+  // and the two-second wait — all of which used to happen for a trigger that
+  // `runSync` was then going to refuse anyway.
+  if (isSyncInProgress()) {
+    mainWindow.webContents.send('system:log', 'A sync is already running; this trigger is skipped.');
     return;
   }
 
@@ -497,7 +525,7 @@ async function syncFolder(folder) {
       log: sendLog,
       onFileStatus: (filePath, { status, label }) => {
         mainWindow.webContents.send('sync:updateStatus', { fileName: filePath, status, label });
-        logFileResult(filePath, status === 'Synced', label);
+        logFileResult(filePath, status, label);
       },
     });
   } catch (error) {
@@ -541,6 +569,17 @@ ipcMain.on('journal:reset', async () => {
       'No files on disk are changed.',
   });
   if (choice !== 0) return;
+  // Re-checked AFTER the dialog: the scheduled run starts with a two-second
+  // wait before it raises the flag, and a dialog is exactly long enough for a
+  // trigger to land in that gap. The first check refuses the obvious case;
+  // this one refuses the race.
+  if (isSyncInProgress()) {
+    mainWindow.webContents.send(
+      'system:log',
+      'A sync started while the dialog was open. Reset the history when it has finished.',
+    );
+    return;
+  }
 
   await journal.resetAll(dbConfig.db);
   mainWindow.webContents.send('system:log', 'Upload history reset. Every file will be checked again on the next sync.');

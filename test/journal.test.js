@@ -187,3 +187,75 @@ test('fileCacheSet upserts by path', async () => {
   assert.equal(cached.hash, 'new');
   assert.equal(cached.size, 11);
 });
+
+test('applyVerdict: a non-terminal verdict never re-opens a parked or imported row', async () => {
+  await journal.upsertPending(db, [
+    { hash: 'p', fileName: 'p.ddd' },
+    { hash: 'i', fileName: 'i.ddd' },
+  ]);
+  await journal.applyVerdict(db, 'p', { state: STATE.PARKED, verdict: 'FAILED' });
+  await journal.applyVerdict(db, 'i', { state: STATE.IMPORTED, verdict: 'DONE' });
+
+  await journal.applyVerdict(db, 'p', { state: STATE.UPLOADED, verdict: 'FAILED' });
+  await journal.applyVerdict(db, 'i', { state: STATE.UPLOADED, verdict: 'WAITING' });
+
+  assert.equal((await row('p')).state, STATE.PARKED);
+  assert.equal((await row('i')).state, STATE.IMPORTED);
+  // A terminal verdict still applies to a parked row: the server may hold a
+  // good copy of the bytes after all.
+  await journal.applyVerdict(db, 'p', { state: STATE.IMPORTED, verdict: 'ALREADY_IMPORTED' });
+  assert.equal((await row('p')).state, STATE.IMPORTED);
+});
+
+test('applyVerdict with a jobId speaks only for the rows that job owns', async () => {
+  await journal.upsertPending(db, [{ hash: 'a', fileName: 'a.ddd' }]);
+  await journal.markUploaded(db, [{ hash: 'a', importId: 1 }], 'job-2');
+
+  await journal.applyVerdict(db, 'a', { state: STATE.PARKED, verdict: 'FAILED' }, { jobId: 'job-1' });
+  assert.equal((await row('a')).state, STATE.UPLOADED, 'an older job cannot speak over the newer one');
+
+  await journal.applyVerdict(db, 'a', { state: STATE.PARKED, verdict: 'FAILED' }, { jobId: 'job-2' });
+  assert.equal((await row('a')).state, STATE.PARKED);
+});
+
+test('parkExhausted parks only rows that hold a retryable failure or never got an upload', async () => {
+  await journal.upsertPending(db, [
+    { hash: 'inflight', fileName: 'a.ddd' },
+    { hash: 'failed', fileName: 'b.ddd' },
+    { hash: 'never', fileName: 'c.ddd' },
+  ]);
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt += 1) {
+    await journal.markUploaded(
+      db,
+      [
+        { hash: 'inflight', importId: 1 },
+        { hash: 'failed', importId: 2 },
+      ],
+      `job-${attempt}`,
+    );
+  }
+  await journal.applyVerdict(db, 'failed', { state: STATE.UPLOADED, verdict: 'FAILED' });
+  await journal.recordTransportFailure(db, ['never'], 'HTTP 500');
+  await journal.recordTransportFailure(db, ['never'], 'HTTP 500');
+  await journal.recordTransportFailure(db, ['never'], 'HTTP 500');
+
+  await journal.parkExhausted(db, MAX_ATTEMPTS);
+
+  assert.equal(
+    (await row('inflight')).state,
+    STATE.UPLOADED,
+    'an upload the server is still working on is not an exhausted attempt',
+  );
+  assert.equal((await row('failed')).state, STATE.PARKED);
+  assert.equal((await row('never')).state, STATE.PARKED);
+});
+
+test('markUploaded clears the previous verdict and reason', async () => {
+  await journal.upsertPending(db, [{ hash: 'a', fileName: 'a.ddd' }]);
+  await journal.recordTransportFailure(db, ['a'], 'HTTP 500');
+  await journal.markUploaded(db, [{ hash: 'a', importId: 1 }], 'job-1');
+  const stored = await row('a');
+  assert.equal(stored.verdict, null);
+  assert.equal(stored.reason_message, null);
+  assert.equal(stored.attempts, 2);
+});
