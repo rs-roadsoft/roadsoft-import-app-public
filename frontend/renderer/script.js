@@ -402,7 +402,7 @@ async function removePathRecursiveSyncSafe(targetPath, rootGuard) {
 /**
  * Per-file status update:
  * - find the row by hidden absolute path cell
- * - move file or its top-level folder to Archived/Failed (ONLY within chosen root)
+ * - move the settled file to Archived/Failed, keeping its relative path (ONLY within chosen root)
  * - update only that row's status
  * - overwrite behavior is atomic: delete destination first, with root guard
  */

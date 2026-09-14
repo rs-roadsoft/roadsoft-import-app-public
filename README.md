@@ -23,8 +23,8 @@ It provides automatic sync scheduling, local configuration storage (SQLite), and
   is checked again.
 - **Post-sync folder handling** — a file moves only once the platform has given its final result:  
   — **imported** files at the root are moved to **Archived**;  
-  — if a file came from a subfolder, the **top-level subfolder** is moved as a whole, following the
-  result of the first file in it;  
+  — a file from a subfolder is moved on its own to the same destination, keeping its relative path;
+  the source folder itself stays where it is;  
   — **refused** and parked files are moved to **Failed**;  
   — a file that is uploaded and still being processed, or not yet sent, stays where it is.  
   This is a convenience for the person looking at the folder. The journal, not the move, is what

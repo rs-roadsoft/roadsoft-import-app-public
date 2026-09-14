@@ -35,7 +35,7 @@
   "note_label": "Opmerking",
   "note_hidden": "De map `AppData` is standaard verborgen in Windows. Schakel <strong>\"Verborgen bestanden weergeven\"</strong> in via Verkenner om deze te openen.",
   "section_file_processing": "Bestandsverwerking & opslag",
-  "file_processing_intro": "Een bestand wordt verplaatst zodra het RoadSoft-platform het definitieve resultaat heeft gegeven. Losse `.ddd`/`.esm`-bestanden op het hoofdniveau worden individueel verplaatst; wanneer een bestand zich in een submap bevindt, wordt de volledige bovenliggende map verplaatst om de mapstructuur te behouden, op basis van het resultaat van het eerste bestand erin. Een bestand dat is geüpload en nog wordt verwerkt, of dat nog niet kon worden verzonden, blijft in de map staan. Beschadigde `.zip`-archieven worden tijdens de eerste scan naar `Failed/` verplaatst.",
+  "file_processing_intro": "Een bestand wordt verplaatst zodra het RoadSoft-platform het definitieve resultaat heeft gegeven. Losse `.ddd`/`.esm`-bestanden op het hoofdniveau worden individueel verplaatst; wanneer een bestand zich in een submap bevindt, wordt alleen dat bestand verplaatst, met behoud van zijn relatieve pad onder `Archived/` of `Failed/`; de map zelf blijft staan. Een bestand dat is geüpload en nog wordt verwerkt, of dat nog niet kon worden verzonden, blijft in de map staan. Beschadigde `.zip`-archieven worden tijdens de eerste scan naar `Failed/` verplaatst.",
   "col_folder": "Map",
   "col_purpose": "Doel",
   "col_contents": "Inhoud",

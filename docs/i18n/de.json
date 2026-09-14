@@ -35,7 +35,7 @@
   "note_label": "Hinweis",
   "note_hidden": "Der Ordner `AppData` ist in Windows standardm\u00e4\u00dfig ausgeblendet. Aktivieren Sie <strong>\u201eAusgeblendete Elemente\u201c</strong> im Datei-Explorer, um darauf zuzugreifen.",
   "section_file_processing": "Dateiverarbeitung & Speicherung",
-  "file_processing_intro": "Eine Datei wird verschoben, sobald die RoadSoft-Plattform ihr endgültiges Ergebnis gemeldet hat. Einzelne `.ddd`/`.esm`-Dateien auf der obersten Ebene werden einzeln verschoben; befindet sich eine Datei in einem Unterordner, wird der gesamte übergeordnete Ordner verschoben, um die Verzeichnisstruktur beizubehalten — nach dem Ergebnis der ersten Datei darin. Eine Datei, die hochgeladen ist und noch verarbeitet wird oder noch nicht gesendet werden konnte, bleibt im Ordner. Beschädigte `.zip`-Archive werden beim ersten Scan in den Ordner `Failed/` verschoben.",
+  "file_processing_intro": "Eine Datei wird verschoben, sobald die RoadSoft-Plattform ihr endgültiges Ergebnis gemeldet hat. Einzelne `.ddd`/`.esm`-Dateien auf der obersten Ebene werden einzeln verschoben; befindet sich eine Datei in einem Unterordner, wird nur diese Datei verschoben, wobei ihr relativer Pfad unter `Archived/` bzw. `Failed/` erhalten bleibt; der Ordner selbst bleibt an seinem Platz. Eine Datei, die hochgeladen ist und noch verarbeitet wird oder noch nicht gesendet werden konnte, bleibt im Ordner. Beschädigte `.zip`-Archive werden beim ersten Scan in den Ordner `Failed/` verschoben.",
   "col_folder": "Ordner",
   "col_purpose": "Zweck",
   "col_contents": "Inhalt",
