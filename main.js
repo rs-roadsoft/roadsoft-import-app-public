@@ -7,13 +7,16 @@ require('@electron/remote/main').initialize();
 const axios = require('axios');
 const path = require('path');
 const fs = require('fs');
-const FormData = require('form-data');
 // TODO: enable auto updater after setting up code signing key
 // const { autoUpdater } = require('electron-updater');
 const log = require('electron-log');
 const AutoLaunch = require('auto-launch');
 
 const dbConfig = require('./models/settings');
+const journal = require('./models/journal');
+const { gatherSyncFiles } = require('./sync/gather');
+const { createApi } = require('./sync/api');
+const { runSync, summarize, isSyncInProgress } = require('./sync/sync-folder');
 const setting = require('./setting');
 const packageJson = require('./package.json');
 
@@ -25,27 +28,7 @@ function getCustomHeaders() {
   };
 }
 
-const MAX_SCAN_DEPTH = 10;
-const DIRS = Object.freeze({ ARCHIVED: 'Archived', FAILED: 'Failed' });
-const EXT = Object.freeze({ DDD: '.ddd', ESM: '.esm' });
 const PLATFORMS = Object.freeze({ MAC: 'darwin', WIN: 'win32' });
-
-// Bulk API constants
-const BULK_BATCH_SIZE = 100;
-const BULK_RETRY_DELAY_MS = 30000; // 30 seconds
-const BULK_MAX_RETRIES = 20;
-
-function chunk(array, size) {
-  const result = [];
-  for (let i = 0; i < array.length; i += size) {
-    result.push(array.slice(i, i + size));
-  }
-  return result;
-}
-
-function delay(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
 
 let mainWindow;
 let companyIdentifier = '';
@@ -171,6 +154,19 @@ function createTray() {
 
 app.whenReady().then(async () => {
   Menu.setApplicationMenu(null);
+
+  // The upload journal's tables, created on first start after this version.
+  // Nothing runs knex migrations in this app: the packaged build copies
+  // `app/config.db` into userData once, so an existing install never sees a
+  // new template. Idempotent, and cheap on every later start.
+  try {
+    await journal.ensureSchema(dbConfig.db);
+  } catch (error) {
+    // Without the journal a sync cannot run, but a start-up that dies here
+    // shows nothing at all — no window, no tray, no log line. Show the window
+    // and say so; the sync will report the same failure where it can be read.
+    log.error('Could not prepare the upload journal:', error);
+  }
 
   // Load auto-start preferences from DB
   const autoStartEnabled = await dbConfig.getSetting('auto_start_enabled');
@@ -299,52 +295,6 @@ app.on('window-all-closed', function () {
   if (process.platform !== PLATFORMS.MAC) app.quit();
 });
 
-/* ===================================== HELPER: collect files recursively ===================================== */
-/**
- * Recursively walk a directory (depth-limited) and collect .ddd/.esm files from all subfolders (including nested subfolders).
- * - Skips the special folders "Archived" and "Failed" at the top level.
- * - Max depth: 10
- * NOTE: main process only READS files; all moving/deleting is handled (safely) in renderer with path guards.
- */
-function gatherSyncFiles(rootDir, currentDir = rootDir, depth = 0, maxDepth = MAX_SCAN_DEPTH, collected = []) {
-  if (depth > maxDepth) {
-    return collected;
-  }
-
-  let entries;
-  try {
-    entries = fs.readdirSync(currentDir, { withFileTypes: true });
-  } catch (err) {
-    console.log('Error reading dir:', currentDir, err.message);
-    return collected;
-  }
-
-  entries.forEach((entry) => {
-    const fullPath = path.join(currentDir, entry.name);
-
-    // Skip special folders "Archived" and "Failed" from the root level
-    if (
-      depth === 0 &&
-      (entry.name.toLowerCase() === DIRS.ARCHIVED.toLowerCase() ||
-        entry.name.toLowerCase() === DIRS.FAILED.toLowerCase()) &&
-      entry.isDirectory()
-    ) {
-      return;
-    }
-
-    if (entry.isDirectory()) {
-      gatherSyncFiles(rootDir, fullPath, depth + 1, maxDepth, collected);
-    } else {
-      const ext = path.extname(entry.name).toLowerCase();
-      if (ext === EXT.DDD || ext === EXT.ESM) {
-        collected.push(fullPath);
-      }
-    }
-  });
-
-  return collected;
-}
-
 /* ===================================== IPC Communication ===================================== */
 
 //pre sets
@@ -416,12 +366,23 @@ async function connect(company_id, api_key) {
       'API-KEY': api_key,
       ...getCustomHeaders(),
     },
+    // Every request is bounded — see `sync/api.js`. This one was not, and it
+    // is awaited before the scheduler is armed: a half-open connection at
+    // start-up meant no hourly sync until the app was restarted.
+    timeout: 30_000,
   };
 
   try {
     const response = await axios(config);
 
     if (response) {
+      // The journal's verdicts belong to ONE company. Pointed at another, an
+      // `imported` row would keep a file from ever reaching the new company,
+      // and old job ids would be polled against it every run. Start over.
+      if (companyIdentifier && companyIdentifier !== company_id) {
+        await journal.resetAll(dbConfig.db);
+        log.info(`Company changed from ${companyIdentifier} to ${company_id}; upload history reset`);
+      }
       apiKey = api_key;
       companyIdentifier = company_id;
       dbConfig.setSetting('api_key', apiKey);
@@ -497,42 +458,45 @@ ipcMain.on('sync:start', async () => {
 });
 
 /* ===================================== SYNC LOGIC (updated) ===================================== */
-function logFileResult(file, success, errorMessage = '') {
+function logFileResult(file, status, label = '') {
   const logFilePath = path.join(app.getPath('userData'), 'log.txt');
 
   if (!fs.existsSync(logFilePath)) {
     fs.writeFileSync(logFilePath, '', { flag: 'w' });
   }
 
-  const status = success ? 'Success' : `Failed: ${errorMessage}`;
-  fs.appendFileSync(logFilePath, `[${new Date().toLocaleString()}] (${status}) ${path.basename(file)}\n`);
+  // Three outcomes, like the table. A pending file used to be logged as
+  // "Failed: Uploaded — waiting for verdict", which is not what happened to it.
+  const line = status === 'Synced' ? 'Success' : status === 'Not Synced' ? `Failed: ${label}` : `Pending: ${label}`;
+  fs.appendFileSync(logFilePath, `[${new Date().toLocaleString()}] (${line}) ${path.basename(file)}\n`);
 }
 
-function generateSyncSummary(stats) {
-  let message = '';
-
-  if (stats.success > 0) {
-    message += `Successfully synced: ${stats.success}`;
-  }
-
-  if (stats.failed > 0) {
-    if (message) message += ' | ';
-    message += `Failed: ${stats.failed}`;
-  }
-
-  message += ' files';
-  return message;
-}
-
+/**
+ * One sync run. The logic lives in `sync/sync-folder.js`; this is the Electron
+ * edge — the window messages, the log file, and the API bound to the current
+ * credentials.
+ *
+ * What the journal changes about the messages the renderer receives: `status`
+ * is still 'Synced' / 'Not Synced', which is what the renderer keys its
+ * Archived/Failed move on, and `label` is new — the journal's own text for the
+ * file table, carrying the server's reason when there is one.
+ */
 async function syncFolder(folder) {
   if (!folder) {
     mainWindow.webContents.send('system:log', 'No folder selected for sync.');
     return;
   }
 
-  // Check if folder exists
   if (!fs.existsSync(folder)) {
     mainWindow.webContents.send('system:log', `Error: Selected folder does not exist: ${folder}`);
+    return;
+  }
+
+  // Refused up front, before the table rebuild, the unzip pass, the spinner
+  // and the two-second wait — all of which used to happen for a trigger that
+  // `runSync` was then going to refuse anyway.
+  if (isSyncInProgress()) {
+    mainWindow.webContents.send('system:log', 'A sync is already running; this trigger is skipped.');
     return;
   }
 
@@ -543,122 +507,84 @@ async function syncFolder(folder) {
   mainWindow.webContents.send('sync:changeStatusToProcessing');
   mainWindow.webContents.send('system:log', 'Processing sync..');
 
-  // collect all .ddd / .esm from root + subfolders (depth up to 10)
-  const filesToSync = gatherSyncFiles(folder);
+  const api = createApi({
+    baseUrl: setting.baseUrl,
+    companyIdentifier,
+    apiKey,
+    headers: getCustomHeaders(),
+  });
+  const sendLog = (message) => mainWindow.webContents.send('system:log', message);
 
-  // If no files to sync, log and return
-  if (filesToSync.length === 0) {
-    mainWindow.webContents.send('system:log', 'No files to sync');
+  let counts;
+  try {
+    counts = await runSync({
+      db: dbConfig.db,
+      api,
+      folder,
+      gather: gatherSyncFiles,
+      log: sendLog,
+      onFileStatus: (filePath, { status, label }) => {
+        mainWindow.webContents.send('sync:updateStatus', { fileName: filePath, status, label });
+        logFileResult(filePath, status, label);
+      },
+    });
+  } catch (error) {
+    // Not a per-file failure — those are journaled — but the run itself
+    // breaking, which must be visible rather than a silent stop.
+    log.error('Sync failed:', error);
+    sendLog(`Sync failed: ${error.message}`);
     return;
   }
 
-  // Track completion of all file uploads
-  const syncStats = { total: 0, success: 0, failed: 0 };
+  sendLog(summarize(counts));
+  if (!counts.refused && !counts.unreachable) {
+    mainWindow.webContents.send('system:update-last-sync', new Date().toLocaleString());
+  }
+}
 
-  // Split files into batches for bulk API
-  const batches = chunk(filesToSync, BULK_BATCH_SIZE);
-
-  for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
-    const batch = batches[batchIndex];
-
-    // Prepare FormData with files
-    let formData = new FormData();
-    for (const file of batch) {
-      formData.append('files', fs.createReadStream(file), path.basename(file));
-    }
-
-    // Send with retry on queue overflow
-    let retries = 0;
-    let shouldExitRetryLoop = false;
-
-    while (!shouldExitRetryLoop && retries < BULK_MAX_RETRIES) {
-      try {
-        const response = await axios({
-          method: 'post',
-          url: `${setting.baseUrl}/api/v2/tachofile/import/company/${companyIdentifier}/bulk`,
-          headers: {
-            'API-KEY': apiKey,
-            ...formData.getHeaders(),
-            ...getCustomHeaders(),
-          },
-          data: formData,
-          maxContentLength: Infinity,
-          maxBodyLength: Infinity,
-        });
-
-        if (response.data && response.data.jobId) {
-          // Success — update status for all files in batch
-          syncStats.success += batch.length;
-          batch.forEach((file) => {
-            mainWindow.webContents.send('sync:updateStatus', {
-              code: 200,
-              message: 'Synced successfully',
-              fileName: file,
-              status: 'Synced',
-            });
-            logFileResult(file, true);
-          });
-        }
-        shouldExitRetryLoop = true;
-      } catch (error) {
-        const codeName = error.response?.data?.codeName;
-
-        if (codeName === 'file-upload/too-many-files-in-queue') {
-          retries++;
-          mainWindow.webContents.send(
-            'system:log',
-            `Queue full, waiting ${BULK_RETRY_DELAY_MS / 1000}s... (${retries}/${BULK_MAX_RETRIES})`,
-          );
-          await delay(BULK_RETRY_DELAY_MS);
-
-          // Recreate FormData for retry (stream is already consumed)
-          formData = new FormData();
-          for (const file of batch) {
-            formData.append('files', fs.createReadStream(file), path.basename(file));
-          }
-        } else {
-          // Other error — mark entire batch as failed
-          console.log('Error: ', error);
-          syncStats.failed += batch.length;
-          batch.forEach((file) => {
-            mainWindow.webContents.send('sync:updateStatus', {
-              code: error.response?.status || 500,
-              message: error.message || 'Error occurred by API',
-              fileName: file,
-              status: 'Not Synced',
-            });
-            logFileResult(file, false, error.message);
-          });
-          shouldExitRetryLoop = true; // Exit retry loop
-        }
-      }
-    }
-
-    // Max retries exceeded — mark as failed
-    if (!shouldExitRetryLoop) {
-      syncStats.failed += batch.length;
-      batch.forEach((file) => {
-        mainWindow.webContents.send('sync:updateStatus', {
-          code: 503,
-          message: 'Max retries exceeded',
-          fileName: file,
-          status: 'Not Synced',
-        });
-        logFileResult(file, false, 'Max retries exceeded');
-      });
-    }
-
-    syncStats.total += batch.length;
-    mainWindow.webContents.send('system:log', `Batch ${batchIndex + 1}/${batches.length} complete`);
+/**
+ * The Reset history button. Forgets every verdict and every cached hash, so the
+ * next sync asks the server about every file again. Files on disk are not
+ * touched. Confirmed first: this is the one way to make a parked file be sent
+ * again, and it re-arms the whole folder at once.
+ */
+ipcMain.on('journal:reset', async () => {
+  // Clearing the journal under a running sync leaves that run reading rows
+  // that no longer exist — a TypeError, no statuses sent, files stuck on
+  // "Synchronizing". Refuse rather than race it.
+  if (isSyncInProgress()) {
+    mainWindow.webContents.send('system:log', 'A sync is running. Reset the history when it has finished.');
+    return;
+  }
+  const choice = dialog.showMessageBoxSync(mainWindow, {
+    type: 'warning',
+    buttons: ['Reset history', 'Cancel'],
+    defaultId: 1,
+    cancelId: 1,
+    title: 'Reset upload history',
+    message: 'Forget every upload result and retry count?',
+    detail:
+      'Every file in the folder will be checked with the server again on the next sync. ' +
+      'Files the server already holds or has refused are recognised and skipped; the rest are uploaded. ' +
+      'No files on disk are changed.',
+  });
+  if (choice !== 0) return;
+  // Re-checked AFTER the dialog: the scheduled run starts with a two-second
+  // wait before it raises the flag, and a dialog is exactly long enough for a
+  // trigger to land in that gap. The first check refuses the obvious case;
+  // this one refuses the race.
+  if (isSyncInProgress()) {
+    mainWindow.webContents.send(
+      'system:log',
+      'A sync started while the dialog was open. Reset the history when it has finished.',
+    );
+    return;
   }
 
-  // Final summary message
-  const summaryMessage = generateSyncSummary(syncStats);
-  mainWindow.webContents.send('system:log', summaryMessage);
-
-  // tell renderer to update "last sync" timestamp in UI
-  mainWindow.webContents.send('system:update-last-sync', new Date().toLocaleString());
-}
+  await journal.resetAll(dbConfig.db);
+  mainWindow.webContents.send('system:log', 'Upload history reset. Every file will be checked again on the next sync.');
+  mainWindow.webContents.send('sync:updateFiles');
+});
 
 ipcMain.on('app:getVersion', () => {
   mainWindow.webContents.send('app:setVersion', app.getVersion());

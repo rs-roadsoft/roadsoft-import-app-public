@@ -355,6 +355,11 @@ $('#sync-now').on('click', function () {
   ipcRenderer.send('sync:start');
 });
 
+// The main process asks for confirmation before it clears anything.
+$('#reset-history').on('click', function () {
+  ipcRenderer.send('journal:reset');
+});
+
 /* =========================================================================
    TABLE STATUS UPDATES
    ========================================================================= */
@@ -362,7 +367,9 @@ $('#sync-now').on('click', function () {
 /** Flip all rows to "Synchronizing" at sync start (row-wise, not a full rebuild). */
 function changeStatusToProcessing() {
   filesDataTable.rows((idx, data) => {
-    if (data[2] === 'Not Synced' || /Synchro/i.test(String(data[2]))) {
+    // Rows that may still change this run: never synced, uploaded and waiting,
+    // or already spinning. Imported and parked rows are settled and stay put.
+    if (/^Not synced|^Uploaded|Synchro/i.test(String(data[2]))) {
       filesDataTable
         .row(idx)
         .data([data[0], data[1], '<i class="fa fa-refresh fa-spin"></i>&nbsp;&nbsp; Synchronizing'])
@@ -395,7 +402,7 @@ async function removePathRecursiveSyncSafe(targetPath, rootGuard) {
 /**
  * Per-file status update:
  * - find the row by hidden absolute path cell
- * - move file or its top-level folder to Archived/Failed (ONLY within chosen root)
+ * - move the settled file to Archived/Failed, keeping its relative path (ONLY within chosen root)
  * - update only that row's status
  * - overwrite behavior is atomic: delete destination first, with root guard
  */
@@ -427,7 +434,13 @@ ipcRenderer.on('sync:updateStatus', async function (event, data) {
       fs.mkdirSync(targetRootDir);
     }
 
-    if (fs.existsSync(fileResolved)) {
+    // Only a settled file moves: 'Synced' to Archived/, 'Not Synced' to Failed/.
+    // A 'Pending' file — uploaded and waiting for its verdict, or not yet sent
+    // — stays in the folder so the next run can finish with it. Moving it to
+    // Failed/ on a first failed attempt hid it from every later run, which
+    // made the retry the journal counts impossible.
+    const settled = data.status === 'Synced' || data.status === 'Not Synced';
+    if (settled && fs.existsSync(fileResolved)) {
       const relFromRoot = path.relative(rootResolved, fileResolved);
       const parts = relFromRoot.split(path.sep).filter(Boolean); // drop empty parts
 
@@ -450,36 +463,24 @@ ipcRenderer.on('sync:updateStatus', async function (event, data) {
           addLog(`[Guard] Refuse to move top-level file outside target dir: ${destFilePath}`);
         }
       } else {
-        // File is inside a subfolder: move entire top-level folder
-        const topLevelFolderName = parts[0];
-
-        // Guard 3: first segment cannot be "." or ".." and must be a plain name
-        if (!topLevelFolderName || topLevelFolderName === '.' || topLevelFolderName === '..') {
-          addLog(`[Guard] Invalid top-level name for move: "${topLevelFolderName}" from ${relFromRoot}`);
+        // A file inside a subfolder moves ALONE, keeping its relative path —
+        // never its whole top-level folder. Moving the folder on the first
+        // settled file took every pending sibling out of the scan with it:
+        // their retries never happened, a FAILED-retryable sibling was polled
+        // for ever, and a parked sibling could land in Archived/. The source
+        // folder stays where it is, even once it is empty.
+        const destFilePath = path.join(targetRootDir, relFromRoot);
+        if (!isPathInside(targetRootDir, destFilePath)) {
+          addLog(`[Guard] Refuse to move file outside target dir: ${destFilePath}`);
         } else {
-          const srcTopFolderPath = path.join(rootResolved, topLevelFolderName);
-          const destTopFolderPath = path.join(targetRootDir, topLevelFolderName);
-
-          // Guard 4: both src and dest must be inside root / targetRootDir respectively
-          const srcOk =
-            isPathInside(rootResolved, srcTopFolderPath) || realResolve(srcTopFolderPath) === realResolve(rootResolved);
-          const dstOk =
-            isPathInside(targetRootDir, destTopFolderPath) ||
-            realResolve(destTopFolderPath) === realResolve(targetRootDir);
-
-          if (srcOk && dstOk && fs.existsSync(srcTopFolderPath)) {
-            if (fs.existsSync(destTopFolderPath)) {
-              await removePathRecursiveSyncSafe(destTopFolderPath, rootResolved);
-            }
-            try {
-              await fs.promises.rename(srcTopFolderPath, destTopFolderPath);
-            } catch (err) {
-              addLog(`Error moving folder: ${err?.message}`);
-            }
-          } else {
-            addLog(
-              `[Guard] Refuse to move folder. srcOk=${srcOk} dstOk=${dstOk} src=${srcTopFolderPath} dst=${destTopFolderPath}`,
-            );
+          fs.mkdirSync(path.dirname(destFilePath), { recursive: true });
+          if (fs.existsSync(destFilePath)) {
+            await removePathRecursiveSyncSafe(destFilePath, rootResolved);
+          }
+          try {
+            await fs.promises.rename(fileResolved, destFilePath);
+          } catch (err) {
+            addLog(`Error moving file: ${err?.message}`);
           }
         }
       }
@@ -488,7 +489,12 @@ ipcRenderer.on('sync:updateStatus', async function (event, data) {
     if (rowIndexes && rowIndexes.length > 0) {
       const rowIdx = rowIndexes[0];
       const rowData = filesDataTable.row(rowIdx).data();
-      filesDataTable.row(rowIdx).data([rowData[0], rowData[1], data.status]).draw(false);
+      // `label` is the journal's text — the server's reason when there is one.
+      // `status` stays the move selector above and the fallback here.
+      filesDataTable
+        .row(rowIdx)
+        .data([rowData[0], rowData[1], escapeHtml(data.label ?? data.status)])
+        .draw(false);
     }
   }
 });

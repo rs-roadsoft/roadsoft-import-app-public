@@ -61,4 +61,7 @@ module.exports = {
   getSetting,
   setSetting,
   refreshLastSync,
+  // The connection itself, so the upload journal lives in the same database
+  // file as the settings and needs no second path or second copy step.
+  db: table,
 };

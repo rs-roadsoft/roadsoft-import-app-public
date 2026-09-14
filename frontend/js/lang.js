@@ -16,6 +16,7 @@ let languagePack = {
         },
         scheduleSync: "Schedule Sync",
         syncNow: "Sync Now",
+        resetHistory: "Reset history",
         lastSync: "Last Sync at:",
         dataTableLangUrl: "https://cdn.datatables.net/plug-ins/1.12.1/i18n/en-GB.json"
     }
@@ -32,6 +33,7 @@ function changeLanguage(textObj) {
     $('label[for="sync-trigger"]').text(textObj.syncTrigger);
     $('#scheduleSync').text(textObj.scheduleSync);
     $('#syncNow').text(textObj.syncNow);
+    $('#resetHistory').text(textObj.resetHistory);
     $('#lastSync').text(textObj.lastSync);
 
     $("#trigger").empty();
