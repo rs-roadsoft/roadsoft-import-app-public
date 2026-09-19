@@ -13,12 +13,17 @@ It provides automatic sync scheduling, local configuration storage (SQLite), and
 - **Auto-unzip archives:** automatically extracts `.zip` files, including **nested zips**  
   — on success the original archive is removed; on failure (e.g., password/corruption) the zip is moved to **Failed** folder
   and any partial files/folders are cleaned up
-- **Smart post-sync handling:**  
-  — synced files at the root are moved to **Archived**;  
-  — if a file came from a subfolder, the **top-level subfolder** is archived as a whole;  
-  — failed items are moved to **Failed**
+- **Server check before upload:** every file is identified by the md5 of its bytes; before uploading, the
+  app asks the RoadSoft API (`hash-check`) which files it already holds or has permanently rejected and uploads only
+  the rest. Files the server already has go to **Archived** without an upload; files it rejected go to **Failed**
+  with the status _Rejected by server_. Two copies of one file are one upload. If the server cannot be reached the
+  run is postponed and nothing is sent. The server is the only memory — nothing about files is stored locally.
+- **Post-sync handling:**  
+  — each synced `.ddd`/`.esm` file is moved **on its own** to **Archived**, keeping its relative path (a file from
+  `vehicles/AB-12-CD/` lands in `Archived/vehicles/AB-12-CD/`); the folder it came from stays where it is;  
+  — failed items are moved to **Failed** the same way
 - Supports automatic scheduled sync (every **1h / 12h / 24h** or **on app start**)
-- Local settings stored in **SQLite** database (Company ID, API key, folder, schedule)
+- Local settings stored in **SQLite** database (Company ID, API key, folder, schedule, start-up options); auto-start is on by default and can be switched off in the app
 - Minimize to tray and **auto-launch** on system startup
 - Cross-platform: **Windows** and **macOS**
 
@@ -51,6 +56,12 @@ This creates your personal development database that won't be tracked by git.
 ## Start in development mode
 
 npm run dev
+
+## Run the tests
+
+npm test
+
+(`node --test`, Node 21 or newer; no Electron needed)
 
 ## Build / Packaging (folder app, no installer)
 

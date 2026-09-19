@@ -11,11 +11,22 @@ const FormData = require('form-data');
 // TODO: enable auto updater after setting up code signing key
 // const { autoUpdater } = require('electron-updater');
 const log = require('electron-log');
+// 1 MB with one rotation (the default) is a couple of days of hourly runs.
+log.transports.file.maxSize = 5 * 1024 * 1024;
+// A crash must leave a trace. With these handlers Electron's blocking
+// "A JavaScript error occurred in the main process" dialog is not shown
+// either — on an unattended machine that dialog froze the whole app.
+process.on('uncaughtException', (error) => log.error('Uncaught exception:', error));
+process.on('unhandledRejection', (reason) => log.error('Unhandled rejection:', reason));
 const AutoLaunch = require('auto-launch');
 
 const dbConfig = require('./models/settings');
 const setting = require('./setting');
 const packageJson = require('./package.json');
+const { gatherSyncFiles } = require('./sync/gather');
+const hasher = require('./sync/hasher');
+const { createApi, describeError } = require('./sync/api');
+const { planUpload } = require('./sync/plan');
 
 function getCustomHeaders() {
   return {
@@ -25,9 +36,6 @@ function getCustomHeaders() {
   };
 }
 
-const MAX_SCAN_DEPTH = 10;
-const DIRS = Object.freeze({ ARCHIVED: 'Archived', FAILED: 'Failed' });
-const EXT = Object.freeze({ DDD: '.ddd', ESM: '.esm' });
 const PLATFORMS = Object.freeze({ MAC: 'darwin', WIN: 'win32' });
 
 // Bulk API constants
@@ -173,8 +181,23 @@ app.whenReady().then(async () => {
   Menu.setApplicationMenu(null);
 
   // Load auto-start preferences from DB
-  const autoStartEnabled = await dbConfig.getSetting('auto_start_enabled');
+  let autoStartEnabled = await dbConfig.getSetting('auto_start_enabled');
   const startMinimized = await dbConfig.getSetting('start_minimized');
+
+  // First start on this machine: auto-start is ON unless the user turns it off.
+  // Earlier versions left the setting unset on a fresh install, and `null` meant "do
+  // nothing", so after a server reboot the app did not come back until someone
+  // started it by hand (RS-6238). The 1.0.x builds enabled auto-launch on every
+  // start; this restores that default while keeping the checkbox as the opt-out.
+  if (autoStartEnabled === null || autoStartEnabled === undefined) {
+    autoStartEnabled = 'true';
+    await dbConfig.setSetting('auto_start_enabled', 'true');
+  }
+
+  log.info(
+    `RoadSoft ${app.getVersion()} starting: platform=${process.platform} packaged=${app.isPackaged} ` +
+      `userData=${app.getPath('userData')} autoStart=${autoStartEnabled} startMinimized=${startMinimized}`,
+  );
 
   // Auto-launch only works in production (packaged app)
   if (app.isPackaged) {
@@ -223,7 +246,7 @@ app.whenReady().then(async () => {
 
     if (scheduleId && scheduleInterval && timeSinceLastCheck >= scheduleInterval) {
       log.info('Missed sync during sleep, triggering now');
-      mainWindow.webContents.send('system:log', 'System resumed - checking for missed sync...');
+      sendLog('System resumed - checking for missed sync...');
 
       // Validate folder path before syncing
       if (folderPath && fs.existsSync(folderPath)) {
@@ -255,15 +278,12 @@ app.whenReady().then(async () => {
           if (folderPath && fs.existsSync(folderPath)) {
             syncFolder(folderPath);
           } else {
-            mainWindow.webContents.send('system:log', 'Error: Folder path is invalid or no longer exists');
+            sendLog('Error: Folder path is invalid or no longer exists');
           }
         }, scheduleInterval);
       }, remainingTime);
 
-      mainWindow.webContents.send(
-        'system:log',
-        `Scheduler restarted, next sync in ${Math.round(remainingTime / 60000)} minutes`,
-      );
+      sendLog(`Scheduler restarted, next sync in ${Math.round(remainingTime / 60000)} minutes`);
     }
   });
 
@@ -299,52 +319,6 @@ app.on('window-all-closed', function () {
   if (process.platform !== PLATFORMS.MAC) app.quit();
 });
 
-/* ===================================== HELPER: collect files recursively ===================================== */
-/**
- * Recursively walk a directory (depth-limited) and collect .ddd/.esm files from all subfolders (including nested subfolders).
- * - Skips the special folders "Archived" and "Failed" at the top level.
- * - Max depth: 10
- * NOTE: main process only READS files; all moving/deleting is handled (safely) in renderer with path guards.
- */
-function gatherSyncFiles(rootDir, currentDir = rootDir, depth = 0, maxDepth = MAX_SCAN_DEPTH, collected = []) {
-  if (depth > maxDepth) {
-    return collected;
-  }
-
-  let entries;
-  try {
-    entries = fs.readdirSync(currentDir, { withFileTypes: true });
-  } catch (err) {
-    console.log('Error reading dir:', currentDir, err.message);
-    return collected;
-  }
-
-  entries.forEach((entry) => {
-    const fullPath = path.join(currentDir, entry.name);
-
-    // Skip special folders "Archived" and "Failed" from the root level
-    if (
-      depth === 0 &&
-      (entry.name.toLowerCase() === DIRS.ARCHIVED.toLowerCase() ||
-        entry.name.toLowerCase() === DIRS.FAILED.toLowerCase()) &&
-      entry.isDirectory()
-    ) {
-      return;
-    }
-
-    if (entry.isDirectory()) {
-      gatherSyncFiles(rootDir, fullPath, depth + 1, maxDepth, collected);
-    } else {
-      const ext = path.extname(entry.name).toLowerCase();
-      if (ext === EXT.DDD || ext === EXT.ESM) {
-        collected.push(fullPath);
-      }
-    }
-  });
-
-  return collected;
-}
-
 /* ===================================== IPC Communication ===================================== */
 
 //pre sets
@@ -376,9 +350,15 @@ ipcMain.on('dbConfig:setFolderPath', async (e, newFolderPath) => {
 ipcMain.on('sync:previousSchedule', async () => {
   const scheduleTrigger = await dbConfig.getSetting('sync_schedule');
 
+  log.info(
+    `Startup: trigger=${scheduleTrigger || 'manual'} folder=${folderPath || '(none)'} ` +
+      `credentials=${companyIdentifier && apiKey ? 'yes' : 'no'}`,
+  );
+
   // Always try to reconnect if we have credentials (fixes "not connected" on restart)
   if (companyIdentifier && apiKey) {
     const connection = await connect(companyIdentifier, apiKey);
+    if (!connection) log.warn('Startup connect failed; the schedule is not armed until the next Connect');
 
     // Only restore schedule if connection succeeded and we have a folder
     if (connection && folderPath && scheduleTrigger) {
@@ -428,11 +408,12 @@ async function connect(company_id, api_key) {
       dbConfig.setSetting('company_id', companyIdentifier);
       dbConfig.refreshLastSync();
       mainWindow.webContents.send('config:success');
+      log.info('Connected');
 
       return true;
     }
   } catch (error) {
-    console.log(error.message);
+    log.warn(`Connect failed: ${describeError(error)}`);
     mainWindow.webContents.send('config:error', error?.response?.data?.message || 'Cannot connect');
 
     return false;
@@ -441,6 +422,7 @@ async function connect(company_id, api_key) {
 
 ipcMain.on('sync:schedule', async (_, trigger) => {
   await dbConfig.setSetting('sync_schedule', trigger);
+  log.info(`Schedule set by user: ${trigger || 'manual'}`);
   if (trigger == 'application_start') {
     if (scheduleId) {
       try {
@@ -473,6 +455,7 @@ function scheduleSyncOnHour(hour) {
 
   scheduleInterval = hour * 60 * 60 * 1000;
   lastScheduleCheck = Date.now();
+  log.info(`Schedule armed: every ${hour}h`);
 
   scheduleId = setInterval(() => {
     lastScheduleCheck = Date.now();
@@ -486,7 +469,7 @@ function scheduleSyncOnHour(hour) {
         log.info('Sync completed while window hidden');
       }
     } else {
-      mainWindow.webContents.send('system:log', 'Error: Folder path is invalid or no longer exists');
+      sendLog('Error: Folder path is invalid or no longer exists');
     }
   }, scheduleInterval);
 }
@@ -497,75 +480,128 @@ ipcMain.on('sync:start', async () => {
 });
 
 /* ===================================== SYNC LOGIC (updated) ===================================== */
-function logFileResult(file, success, errorMessage = '') {
+function logFileResult(file, success, note = '') {
   const logFilePath = path.join(app.getPath('userData'), 'log.txt');
 
   if (!fs.existsSync(logFilePath)) {
     fs.writeFileSync(logFilePath, '', { flag: 'w' });
   }
 
-  const status = success ? 'Success' : `Failed: ${errorMessage}`;
+  const status = success ? (note ? `Success: ${note}` : 'Success') : `Failed: ${note}`;
   fs.appendFileSync(logFilePath, `[${new Date().toLocaleString()}] (${status}) ${path.basename(file)}\n`);
 }
 
 function generateSyncSummary(stats) {
-  let message = '';
+  const parts = [];
+  if (stats.uploaded > 0) parts.push(`Successfully synced: ${stats.uploaded}`);
+  if (stats.alreadyOnServer > 0) parts.push(`Already on server: ${stats.alreadyOnServer}`);
+  if (stats.rejected > 0) parts.push(`Rejected by server: ${stats.rejected}`);
+  if (stats.failed > 0) parts.push(`Failed: ${stats.failed}`);
+  return parts.length ? `${parts.join(' | ')} files` : 'Nothing to sync';
+}
 
-  if (stats.success > 0) {
-    message += `Successfully synced: ${stats.success}`;
+/** One line to the window AND to main.log — the textarea is never read on an unattended machine. */
+function sendLog(message) {
+  log.info(message);
+  mainWindow.webContents.send('system:log', message);
+}
+
+/** The same `sync:updateStatus` for every path that holds these bytes. */
+function reportEntry(entry, stats, key, payload) {
+  for (const filePath of entry.paths) {
+    stats[key] += 1;
+    mainWindow.webContents.send('sync:updateStatus', { ...payload, fileName: filePath });
   }
-
-  if (stats.failed > 0) {
-    if (message) message += ' | ';
-    message += `Failed: ${stats.failed}`;
-  }
-
-  message += ' files';
-  return message;
 }
 
 async function syncFolder(folder) {
   if (!folder) {
-    mainWindow.webContents.send('system:log', 'No folder selected for sync.');
+    sendLog('No folder selected for sync.');
     return;
   }
 
   // Check if folder exists
   if (!fs.existsSync(folder)) {
-    mainWindow.webContents.send('system:log', `Error: Selected folder does not exist: ${folder}`);
+    sendLog(`Error: Selected folder does not exist: ${folder}`);
     return;
   }
+  const startedAt = Date.now();
 
   // ask renderer to rebuild its file table (will also trigger unzip logic there)
   mainWindow.webContents.send('sync:updateFiles');
 
   await wait(2000);
   mainWindow.webContents.send('sync:changeStatusToProcessing');
-  mainWindow.webContents.send('system:log', 'Processing sync..');
+  sendLog('Processing sync..');
 
   // collect all .ddd / .esm from root + subfolders (depth up to 10)
   const filesToSync = gatherSyncFiles(folder);
 
-  // If no files to sync, log and return
   if (filesToSync.length === 0) {
-    mainWindow.webContents.send('system:log', 'No files to sync');
+    sendLog('No files to sync');
     return;
   }
 
-  // Track completion of all file uploads
-  const syncStats = { total: 0, success: 0, failed: 0 };
+  // 1. Fingerprint every file (md5 of the bytes — the digest the server derives),
+  //    grouping copies: two paths with the same bytes are one entry, one upload.
+  const entries = await hasher.hashAll(filesToSync, (filePath, error) => {
+    sendLog(`Skipped this run, could not read ${filePath}: ${error.code ?? error.message}`);
+  });
+  if (entries.length === 0) {
+    sendLog('No readable files to sync');
+    return;
+  }
 
-  // Split files into batches for bulk API
-  const batches = chunk(filesToSync, BULK_BATCH_SIZE);
+  // 2. Ask the server which of these it already knows. This is what ends a
+  //    re-upload loop: the Archived/ move below is a convenience that can fail
+  //    (locked file, synced or network folder), and in earlier versions it was the only
+  //    thing between a file and its next upload (RS-7317). The server, not the
+  //    app, remembers — nothing is stored locally.
+  sendLog(`Checking ${entries.length} file(s) with the server..`);
+  const api = createApi({ baseUrl: setting.baseUrl, companyIdentifier, apiKey, headers: getCustomHeaders() });
+  let answers;
+  try {
+    answers = await api.hashCheck(entries.map((entry) => entry.hash));
+  } catch (error) {
+    // Without the answer nothing may be sent — uploading blind is the loop this
+    // check exists to stop. Files stay where they are; the next run asks again.
+    sendLog(`Server unreachable, sync postponed: ${describeError(error)}`);
+    return;
+  }
+  const plan = planUpload(entries, answers);
+  sendLog(
+    `Already on server: ${plan.alreadyImported.length}, rejected by server: ${plan.rejected.length}, to upload: ${plan.toUpload.length}`,
+  );
+
+  const syncStats = { uploaded: 0, alreadyOnServer: 0, rejected: 0, failed: 0 };
+
+  // 3. Files the server already holds go to Archived/ without an upload; files it
+  //    has permanently refused go to Failed/, with the server's verdict as the label.
+  for (const entry of plan.alreadyImported) {
+    reportEntry(entry, syncStats, 'alreadyOnServer', { code: 200, status: 'Synced', label: 'Already on server' });
+    entry.paths.forEach((filePath) => logFileResult(filePath, true, 'already on server'));
+  }
+  for (const entry of plan.rejected) {
+    reportEntry(entry, syncStats, 'rejected', { code: 200, status: 'Not Synced', label: 'Rejected by server' });
+    entry.paths.forEach((filePath) => logFileResult(filePath, false, 'rejected by server'));
+  }
+
+  // 4. Upload the rest — one path per entry, 100 per request. Unchanged from
+  //    2.1.15 apart from the unit being an entry (one content) instead of a path.
+  const batches = chunk(plan.toUpload, BULK_BATCH_SIZE);
 
   for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
     const batch = batches[batchIndex];
 
-    // Prepare FormData with files
-    let formData = new FormData();
-    for (const file of batch) {
-      formData.append('files', fs.createReadStream(file), path.basename(file));
-    }
+    // Prepare FormData with files (rebuilt on retry: a stream can be read once)
+    const buildForm = () => {
+      const form = new FormData();
+      for (const entry of batch) {
+        form.append('files', fs.createReadStream(entry.paths[0]), entry.fileName);
+      }
+      return form;
+    };
+    let formData = buildForm();
 
     // Send with retry on queue overflow
     let retries = 0;
@@ -588,16 +624,10 @@ async function syncFolder(folder) {
 
         if (response.data && response.data.jobId) {
           // Success — update status for all files in batch
-          syncStats.success += batch.length;
-          batch.forEach((file) => {
-            mainWindow.webContents.send('sync:updateStatus', {
-              code: 200,
-              message: 'Synced successfully',
-              fileName: file,
-              status: 'Synced',
-            });
-            logFileResult(file, true);
-          });
+          for (const entry of batch) {
+            reportEntry(entry, syncStats, 'uploaded', { code: 200, message: 'Synced successfully', status: 'Synced' });
+            entry.paths.forEach((filePath) => logFileResult(filePath, true));
+          }
         }
         shouldExitRetryLoop = true;
       } catch (error) {
@@ -605,30 +635,20 @@ async function syncFolder(folder) {
 
         if (codeName === 'file-upload/too-many-files-in-queue') {
           retries++;
-          mainWindow.webContents.send(
-            'system:log',
-            `Queue full, waiting ${BULK_RETRY_DELAY_MS / 1000}s... (${retries}/${BULK_MAX_RETRIES})`,
-          );
+          sendLog(`Queue full, waiting ${BULK_RETRY_DELAY_MS / 1000}s... (${retries}/${BULK_MAX_RETRIES})`);
           await delay(BULK_RETRY_DELAY_MS);
-
-          // Recreate FormData for retry (stream is already consumed)
-          formData = new FormData();
-          for (const file of batch) {
-            formData.append('files', fs.createReadStream(file), path.basename(file));
-          }
+          formData = buildForm();
         } else {
           // Other error — mark entire batch as failed
-          console.log('Error: ', error);
-          syncStats.failed += batch.length;
-          batch.forEach((file) => {
-            mainWindow.webContents.send('sync:updateStatus', {
+          log.error(`Batch ${batchIndex + 1}/${batches.length} failed: ${describeError(error)}`);
+          for (const entry of batch) {
+            reportEntry(entry, syncStats, 'failed', {
               code: error.response?.status || 500,
               message: error.message || 'Error occurred by API',
-              fileName: file,
               status: 'Not Synced',
             });
-            logFileResult(file, false, error.message);
-          });
+            entry.paths.forEach((filePath) => logFileResult(filePath, false, error.message));
+          }
           shouldExitRetryLoop = true; // Exit retry loop
         }
       }
@@ -636,29 +656,28 @@ async function syncFolder(folder) {
 
     // Max retries exceeded — mark as failed
     if (!shouldExitRetryLoop) {
-      syncStats.failed += batch.length;
-      batch.forEach((file) => {
-        mainWindow.webContents.send('sync:updateStatus', {
-          code: 503,
-          message: 'Max retries exceeded',
-          fileName: file,
-          status: 'Not Synced',
-        });
-        logFileResult(file, false, 'Max retries exceeded');
-      });
+      for (const entry of batch) {
+        reportEntry(entry, syncStats, 'failed', { code: 503, message: 'Max retries exceeded', status: 'Not Synced' });
+        entry.paths.forEach((filePath) => logFileResult(filePath, false, 'Max retries exceeded'));
+      }
     }
 
-    syncStats.total += batch.length;
-    mainWindow.webContents.send('system:log', `Batch ${batchIndex + 1}/${batches.length} complete`);
+    sendLog(`Batch ${batchIndex + 1}/${batches.length} complete`);
   }
 
   // Final summary message
-  const summaryMessage = generateSyncSummary(syncStats);
-  mainWindow.webContents.send('system:log', summaryMessage);
+  const seconds = Math.round((Date.now() - startedAt) / 1000);
+  sendLog(`${generateSyncSummary(syncStats)} (${seconds}s)`);
 
   // tell renderer to update "last sync" timestamp in UI
   mainWindow.webContents.send('system:update-last-sync', new Date().toLocaleString());
 }
+
+// Every line the renderer writes to its textarea (unzip, moves, guards) also
+// lands in main.log — the textarea is never read on an unattended machine.
+ipcMain.on('log:write', (e, message) => {
+  log.info(`[renderer] ${message}`);
+});
 
 ipcMain.on('app:getVersion', () => {
   mainWindow.webContents.send('app:setVersion', app.getVersion());

@@ -6,6 +6,9 @@ const fs = require('fs');
 const path = require('path');
 const extractZip = require('extract-zip');
 const trash = require('trash');
+// `__dirname` in the renderer is the folder of index.html (frontend/), so the
+// shared sync modules are one level up.
+const { moveTargetFor, removeEmptyParents } = require(path.join(__dirname, '..', 'sync', 'move-target'));
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const MAX_SCAN_DEPTH = 10;
@@ -86,14 +89,16 @@ ipcRenderer.on('sync:updateFiles', () => {
 
 ipcRenderer.on('config:success', () => {
   connected = true;
-  addLog('Connected');
+  // main.js logs 'Connected' itself; no echo into main.log
+  addLog('Connected', false);
 });
 
 ipcRenderer.on('config:error', (e, error) => {
+  // main.js logs 'Connect failed: <reason>' itself; no echo into main.log
   if (error) {
-    addLog(error);
+    addLog(error, false);
   } else {
-    addLog('Cannot connect');
+    addLog('Cannot connect', false);
   }
 });
 
@@ -395,7 +400,7 @@ async function removePathRecursiveSyncSafe(targetPath, rootGuard) {
 /**
  * Per-file status update:
  * - find the row by hidden absolute path cell
- * - move file or its top-level folder to Archived/Failed (ONLY within chosen root)
+ * - move the settled file to Archived/Failed, keeping its relative path (ONLY within chosen root)
  * - update only that row's status
  * - overwrite behavior is atomic: delete destination first, with root guard
  */
@@ -420,7 +425,12 @@ ipcRenderer.on('sync:updateStatus', async function (event, data) {
         return rowData[0].includes(escapedFilePath);
       });
 
-    // Move file/folder into Archived or Failed
+    // Move the settled file into Archived or Failed, keeping its relative path.
+    // Only the file itself moves — never its folder. Moving the whole top-level
+    // folder on the first settled file took every not-yet-uploaded sibling with
+    // it (RS-7303): on Windows the rename failed with EPERM while the main
+    // process still streamed the next batch from inside it, or it succeeded and
+    // the later batches failed with ENOENT, their files stranded in Archived/.
     const targetType = data.status === 'Synced' ? DIRS.ARCHIVED : DIRS.FAILED;
     const targetRootDir = path.join(rootResolved, targetType);
     if (!fs.existsSync(targetRootDir)) {
@@ -428,74 +438,44 @@ ipcRenderer.on('sync:updateStatus', async function (event, data) {
     }
 
     if (fs.existsSync(fileResolved)) {
-      const relFromRoot = path.relative(rootResolved, fileResolved);
-      const parts = relFromRoot.split(path.sep).filter(Boolean); // drop empty parts
+      const target = moveTargetFor(rootResolved, fileResolved, targetRootDir);
 
-      if (parts.length === 1) {
-        // Top-level file
-        const destFilePath = path.join(targetRootDir, path.basename(fileResolved));
-
-        // Guard 2: destination must be inside targetRootDir
-        if (isPathInside(targetRootDir, destFilePath) || realResolve(destFilePath) === realResolve(targetRootDir)) {
-          // Ensure overwrite semantics on all platforms
-          if (fs.existsSync(destFilePath)) {
-            await removePathRecursiveSyncSafe(destFilePath, rootResolved);
-          }
-          try {
-            await fs.promises.rename(fileResolved, destFilePath);
-          } catch (err) {
-            addLog(`Error moving file: ${err?.message}`);
-          }
-        } else {
-          addLog(`[Guard] Refuse to move top-level file outside target dir: ${destFilePath}`);
+      // Guard 2: destination must be inside targetRootDir (realpath-based, symlink-safe)
+      if (target && isPathInside(targetRootDir, target.destFilePath)) {
+        fs.mkdirSync(path.dirname(target.destFilePath), { recursive: true });
+        // Ensure overwrite semantics on all platforms
+        if (fs.existsSync(target.destFilePath)) {
+          await removePathRecursiveSyncSafe(target.destFilePath, rootResolved);
+        }
+        try {
+          await fs.promises.rename(fileResolved, target.destFilePath);
+          // The folder the file came from goes too once it is empty — one folder
+          // per driver is a common layout, and it vanished on sync in earlier versions.
+          await removeEmptyParents(path.dirname(fileResolved), rootResolved);
+        } catch (err) {
+          addLog(`Error moving file: ${err?.message}`);
         }
       } else {
-        // File is inside a subfolder: move entire top-level folder
-        const topLevelFolderName = parts[0];
-
-        // Guard 3: first segment cannot be "." or ".." and must be a plain name
-        if (!topLevelFolderName || topLevelFolderName === '.' || topLevelFolderName === '..') {
-          addLog(`[Guard] Invalid top-level name for move: "${topLevelFolderName}" from ${relFromRoot}`);
-        } else {
-          const srcTopFolderPath = path.join(rootResolved, topLevelFolderName);
-          const destTopFolderPath = path.join(targetRootDir, topLevelFolderName);
-
-          // Guard 4: both src and dest must be inside root / targetRootDir respectively
-          const srcOk =
-            isPathInside(rootResolved, srcTopFolderPath) || realResolve(srcTopFolderPath) === realResolve(rootResolved);
-          const dstOk =
-            isPathInside(targetRootDir, destTopFolderPath) ||
-            realResolve(destTopFolderPath) === realResolve(targetRootDir);
-
-          if (srcOk && dstOk && fs.existsSync(srcTopFolderPath)) {
-            if (fs.existsSync(destTopFolderPath)) {
-              await removePathRecursiveSyncSafe(destTopFolderPath, rootResolved);
-            }
-            try {
-              await fs.promises.rename(srcTopFolderPath, destTopFolderPath);
-            } catch (err) {
-              addLog(`Error moving folder: ${err?.message}`);
-            }
-          } else {
-            addLog(
-              `[Guard] Refuse to move folder. srcOk=${srcOk} dstOk=${dstOk} src=${srcTopFolderPath} dst=${destTopFolderPath}`,
-            );
-          }
-        }
+        addLog(`[Guard] Refuse to move file outside target dir: ${fileResolved}`);
       }
     }
 
     if (rowIndexes && rowIndexes.length > 0) {
       const rowIdx = rowIndexes[0];
       const rowData = filesDataTable.row(rowIdx).data();
-      filesDataTable.row(rowIdx).data([rowData[0], rowData[1], data.status]).draw(false);
+      // `label` is the server's word for the file when there is one ("Already on
+      // server", "Rejected by server"); `status` stays the move selector above.
+      filesDataTable
+        .row(rowIdx)
+        .data([rowData[0], rowData[1], escapeHtml(data.label ?? data.status)])
+        .draw(false);
     }
   }
 });
 
 // ================================ System logs =============================
 ipcRenderer.on('system:log', function (event, data) {
-  addLog(data);
+  addLog(data, false);
 });
 
 ipcRenderer.on('system:update-last-sync', function (event, data) {
@@ -514,24 +494,20 @@ $('#folder-path').on('click', function (e) {
 
 $('#open-log').on('click', function (e) {
   e.preventDefault();
-
-  const logFilePath = path.join(app.getPath('userData'), 'log.txt');
-
-  if (!fs.existsSync(logFilePath)) {
-    return;
-  }
-
-  // Always open local log.txt in CWD as before
-  shell.openPath(logFilePath);
+  // The folder, not one file: it holds log.txt (per-file results) and
+  // logs/main.log (the app's own log) — "send me what is in this folder".
+  shell.openPath(app.getPath('userData'));
 });
 
 /* =========================================================================
    MISC HELPERS
    ========================================================================= */
 
-function addLog(msg) {
+function addLog(msg, toFile = true) {
   $('#logArea').append(msg + '\n');
   $('#logArea').scrollTop($('#logArea')[0].scrollHeight);
+  // Lines that came FROM the main process are already in main.log.
+  if (toFile) ipcRenderer.send('log:write', String(msg));
 }
 
 ipcRenderer.send('app:getVersion');
