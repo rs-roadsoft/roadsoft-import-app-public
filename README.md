@@ -63,7 +63,7 @@ npm run dev
 
 npm test
 
-(`node --test`, Node 21 or newer; no Electron needed)
+(Node's built-in test runner, Node 21 or newer for the dev machine; the app itself runs on Electron's bundled Node. No Electron needed for the tests.)
 
 ## Build / Packaging (folder app, no installer)
 

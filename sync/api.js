@@ -35,7 +35,17 @@ function createApi({ baseUrl, companyIdentifier, apiKey, headers, request = axio
         headers: authHeaders,
         data: { hashes: batch },
       });
-      for (const result of response.data?.results ?? []) {
+      const answered = response.data?.results;
+      if (!Array.isArray(answered)) {
+        // A 200 that is not the server's answer — a captive portal, a proxy's
+        // login page. Read as "the server knows nothing" it would upload the
+        // whole folder into that page every run. Thrown, so the caller
+        // postpones the run exactly as for an unreachable server.
+        const error = new Error('hash-check answered with HTTP 200 but no results list');
+        error.unexpectedBody = true;
+        throw error;
+      }
+      for (const result of answered) {
         results.set(result.hash, result.status);
       }
     }

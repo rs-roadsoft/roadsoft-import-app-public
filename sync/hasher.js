@@ -34,14 +34,18 @@ async function hashAll(filePaths, onUnreadable = () => {}) {
   const byHash = new Map();
   for (const filePath of filePaths) {
     let hash;
+    let size;
     try {
+      ({ size } = await fs.promises.stat(filePath));
       hash = await hashFile(filePath);
     } catch (error) {
       onUnreadable(filePath, error);
       continue;
     }
     const name = path.basename(filePath);
-    const entry = byHash.get(hash) ?? { hash, fileName: name, paths: [] };
+    // `size` is what the upload declares as Content-Length and what bounds a
+    // batch by bytes; copies share it, since they share the bytes.
+    const entry = byHash.get(hash) ?? { hash, fileName: name, size, paths: [] };
     entry.paths.push(filePath);
     // The name sent to the server is the SHORTEST of the copies' names, ties
     // broken alphabetically — deterministic, and it picks `M_1.DDD` over the

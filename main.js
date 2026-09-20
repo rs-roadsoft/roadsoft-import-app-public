@@ -26,7 +26,7 @@ const packageJson = require('./package.json');
 const { gatherSyncFiles } = require('./sync/gather');
 const hasher = require('./sync/hasher');
 const { createApi, describeError } = require('./sync/api');
-const { planUpload } = require('./sync/plan');
+const { planUpload, batchForUpload } = require('./sync/plan');
 
 function getCustomHeaders() {
   return {
@@ -39,17 +39,24 @@ function getCustomHeaders() {
 const PLATFORMS = Object.freeze({ MAC: 'darwin', WIN: 'win32' });
 
 // Bulk API constants
-const BULK_BATCH_SIZE = 100;
+const BULK_BATCH_SIZE = 100; // the server's MAX_FILES_PER_REQUEST
+/**
+ * The server buffers a whole multipart request in memory and refuses one whose
+ * Content-Length exceeds 200 MiB (`bulk-upload-aggregate-size.guard.ts`,
+ * MAX_TACHO_BULK_UPLOAD_AGGREGATE_BYTES). Batches are cut well under it, so
+ * a folder of large vehicle-unit downloads travels in several requests.
+ */
+const BULK_BATCH_BYTES = 150 * 1024 * 1024;
+/**
+ * The server's per-file cap on this endpoint (`MAX_BUFFERED_FILE_BYTES`: the
+ * parser's 6 MiB plus 1 MiB of slack). Multer aborts the WHOLE request with 413
+ * when one part is over it — nothing in the batch is stored. Such a file is
+ * therefore never sent: it goes to Failed/ with the reason, and its 99
+ * neighbours upload normally.
+ */
+const MAX_UPLOAD_FILE_BYTES = 7 * 1024 * 1024;
 const BULK_RETRY_DELAY_MS = 30000; // 30 seconds
 const BULK_MAX_RETRIES = 20;
-
-function chunk(array, size) {
-  const result = [];
-  for (let i = 0; i < array.length; i += size) {
-    result.push(array.slice(i, i + size));
-  }
-  return result;
-}
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -513,6 +520,7 @@ function generateSyncSummary(stats) {
   if (stats.rejected > 0) parts.push(`Rejected by server: ${stats.rejected}`);
   if (stats.unknown > 0) parts.push(`Unknown server answer, skipped: ${stats.unknown}`);
   if (stats.notSent > 0) parts.push(`Not sent, retry next run: ${stats.notSent}`);
+  if (stats.unreadable > 0) parts.push(`Unreadable, retry next run: ${stats.unreadable}`);
   return parts.length ? `${parts.join(' | ')} files` : 'Nothing to sync';
 }
 
@@ -605,11 +613,15 @@ async function runSync(folder) {
 
   // 1. Fingerprint every file (md5 of the bytes — the digest the server derives),
   //    grouping copies: two paths with the same bytes are one entry, one upload.
+  let unreadable = 0;
   const entries = await hasher.hashAll(filesToSync, (filePath, error) => {
+    unreadable += 1;
     sendLog(`Skipped this run, could not read ${filePath}: ${error.code ?? error.message}`);
   });
   if (entries.length === 0) {
-    sendLog('No readable files to sync');
+    sendLog(
+      unreadable ? `No readable files to sync (${unreadable} unreadable, retry next run)` : 'No readable files to sync',
+    );
     mainWindow.webContents.send('system:update-last-sync', new Date().toLocaleString());
     return;
   }
@@ -634,6 +646,10 @@ async function runSync(folder) {
       sendLog(
         `This server has no hash-check endpoint (HTTP 404); nothing is uploaded until it does: ${describeError(error)}`,
       );
+    } else if (error?.unexpectedBody) {
+      sendLog(
+        `The server's answer was not a file list (a proxy or a login page in the way?), sync postponed: ${error.message}`,
+      );
     } else if (error?.response) {
       sendLog(`Server refused the hash check, sync postponed: ${describeError(error)}`);
     } else {
@@ -652,7 +668,7 @@ async function runSync(folder) {
     );
   }
 
-  const syncStats = { uploaded: 0, uploads: 0, alreadyOnServer: 0, rejected: 0, unknown: 0, notSent: 0 };
+  const syncStats = { uploaded: 0, uploads: 0, alreadyOnServer: 0, rejected: 0, unknown: 0, notSent: 0, unreadable };
 
   // 3. Files the server already holds go to Archived/ without an upload; files it
   //    has permanently refused go to Failed/, with the server's verdict as the label.
@@ -674,18 +690,41 @@ async function runSync(folder) {
     entry.paths.forEach((filePath) => logFileResult(filePath, 'Not sent', `unknown server answer ${entry.status}`));
   }
 
-  // 4. Upload the rest — one path per entry, 100 per request. Unchanged from
-  //    2.1.15 apart from the unit being an entry (one content) instead of a path.
-  const batches = chunk(plan.toUpload, BULK_BATCH_SIZE);
+  // 4. Upload the rest — one path per entry, at most 100 files and 150 MiB per
+  //    request. A file over the server's per-file cap is not sent at all: the
+  //    server would answer 413 for the whole request and nothing in it would be
+  //    stored, so the batch would be offered again next run, for ever.
+  const oversized = plan.toUpload.filter((entry) => entry.size > MAX_UPLOAD_FILE_BYTES);
+  for (const entry of oversized) {
+    const mib = (entry.size / (1024 * 1024)).toFixed(1);
+    sendLog(`Rejected, larger than the server accepts: ${entry.fileName} (${mib} MiB, limit 7 MiB)`);
+    reportEntry(entry, syncStats, 'rejected', {
+      code: 413,
+      status: 'Not Synced',
+      label: `Rejected — ${mib} MiB, larger than the server accepts (7 MiB)`,
+    });
+    entry.paths.forEach((filePath) => logFileResult(filePath, 'Failed', `${mib} MiB, larger than the server accepts`));
+  }
+  const batches = batchForUpload(
+    plan.toUpload.filter((entry) => entry.size <= MAX_UPLOAD_FILE_BYTES),
+    { maxFiles: BULK_BATCH_SIZE, maxBytes: BULK_BATCH_BYTES },
+  );
 
   for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
     const batch = batches[batchIndex];
 
-    // Prepare FormData with files (rebuilt on retry: a stream can be read once)
+    // Prepare FormData with files (rebuilt on retry: a stream can be read once).
+    // Every part declares its length, so the request carries a Content-Length
+    // instead of streaming chunked: that header is what lets the server refuse
+    // an oversized batch before buffering it (two production out-of-memory
+    // crashes were traced to this client's chunked uploads).
     const buildForm = () => {
       const form = new FormData();
       for (const entry of batch) {
-        form.append('files', fs.createReadStream(entry.paths[0]), entry.fileName);
+        form.append('files', fs.createReadStream(entry.paths[0]), {
+          filename: entry.fileName,
+          knownLength: entry.size,
+        });
       }
       return form;
     };
@@ -703,6 +742,7 @@ async function runSync(folder) {
           headers: {
             'API-KEY': apiKey,
             ...formData.getHeaders(),
+            'Content-Length': formData.getLengthSync(),
             ...getCustomHeaders(),
           },
           data: formData,
@@ -717,6 +757,21 @@ async function runSync(folder) {
             reportEntry(entry, syncStats, 'uploaded', { code: 200, message: 'Synced successfully', status: 'Synced' });
             entry.paths.forEach((filePath) => logFileResult(filePath, 'Success'));
           }
+        } else {
+          // A 2xx without a receipt is not an upload the server recorded (a
+          // proxy page, most likely). Said so, and the files stay for next run.
+          log.error(
+            `Batch ${batchIndex + 1}/${batches.length}: HTTP ${response.status} without a jobId, not counted as sent`,
+          );
+          for (const entry of batch) {
+            reportEntry(entry, syncStats, 'notSent', {
+              code: response.status,
+              status: 'Not Synced',
+              move: false,
+              label: 'Not synced — server answered without a receipt (retry next run)',
+            });
+            entry.paths.forEach((filePath) => logFileResult(filePath, 'Not sent', 'no receipt from server'));
+          }
         }
         shouldExitRetryLoop = true;
       } catch (error) {
@@ -724,6 +779,7 @@ async function runSync(folder) {
 
         if (codeName === 'file-upload/too-many-files-in-queue') {
           retries++;
+          if (retries >= BULK_MAX_RETRIES) break; // no point sleeping after the last try
           sendLog(`Queue full, waiting ${BULK_RETRY_DELAY_MS / 1000}s... (${retries}/${BULK_MAX_RETRIES})`);
           await delay(BULK_RETRY_DELAY_MS);
           formData = buildForm();

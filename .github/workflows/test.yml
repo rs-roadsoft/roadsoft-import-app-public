@@ -1,0 +1,25 @@
+name: Tests
+
+# The only thing that runs the suite automatically; the pre-push hook checks
+# formatting only. `node --test` without arguments discovers `test/*.test.js`
+# itself (Node 21+), so the command needs no shell-specific quoting and works
+# from Windows cmd as well as from a POSIX shell.
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      # `--ignore-scripts` skips electron's postinstall download; sqlite3 then
+      # needs its native binding rebuilt for the runner's Node.
+      - run: npm ci --ignore-scripts
+      - run: npm rebuild sqlite3
+      - run: npm test

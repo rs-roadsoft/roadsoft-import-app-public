@@ -41,4 +41,31 @@ function planUpload(entries, answers) {
   return plan;
 }
 
-module.exports = { HASH_CHECK_STATUS, planUpload };
+/**
+ * Cut the upload list into requests of at most `maxFiles` entries AND at most
+ * `maxBytes` of file content. The server buffers a whole multipart request in
+ * memory and refuses one whose Content-Length is over its aggregate cap; a
+ * hundred vehicle-unit downloads at 6 MiB each would be 600 MiB in one request.
+ * An entry larger than `maxBytes` on its own still travels alone — the caller
+ * filters out what the server cannot take at all before it gets here.
+ */
+function batchForUpload(entries, { maxFiles, maxBytes }) {
+  const batches = [];
+  let current = [];
+  let currentBytes = 0;
+  for (const entry of entries) {
+    const tooMany = current.length >= maxFiles;
+    const tooBig = current.length > 0 && currentBytes + entry.size > maxBytes;
+    if (tooMany || tooBig) {
+      batches.push(current);
+      current = [];
+      currentBytes = 0;
+    }
+    current.push(entry);
+    currentBytes += entry.size;
+  }
+  if (current.length) batches.push(current);
+  return batches;
+}
+
+module.exports = { HASH_CHECK_STATUS, planUpload, batchForUpload };

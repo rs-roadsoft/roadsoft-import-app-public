@@ -80,3 +80,11 @@ test('describeError reads status, codeName and message when the server answered,
   const networkError = new Error('connect ECONNREFUSED 127.0.0.1:443');
   assert.equal(describeError(networkError), 'connect ECONNREFUSED 127.0.0.1:443');
 });
+
+test('hashCheck refuses a 200 whose body is not the results list, so a proxy page cannot trigger an upload of everything', async () => {
+  const { request, calls } = fakeRequest(() => '<html>Please accept the terms</html>');
+  const api = createApi({ ...options, request });
+
+  await assert.rejects(api.hashCheck(['aa']), (error) => error.unexpectedBody === true);
+  assert.equal(calls.length, 1);
+});

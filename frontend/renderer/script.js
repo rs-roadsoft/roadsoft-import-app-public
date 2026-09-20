@@ -21,6 +21,10 @@ let connected = false;
 
 // Performance optimization: Set for O(1) lookup instead of O(n) DataTable search
 const addedFilePaths = new Set();
+// path -> DataTables row index, filled as rows are added. A status update used
+// to scan every row for its path: 6,200 files meant 6,200 scans of 6,200 rows
+// and a frozen window while the moves fell behind.
+const rowIndexByPath = new Map();
 // Batching: accumulate rows and flush every BATCH_SIZE
 let pendingRows = [];
 
@@ -224,15 +228,33 @@ async function scanAndUnpack(rootPath, dirPath, depth) {
         addLog(`Error snapshotting dir ${dirPath}: ${snapErr.message}`);
       }
 
+      // Only a failed EXTRACTION means "corrupt archive". Trashing the zip and
+      // rescanning used to sit in the same try: an antivirus holding the zip
+      // for a second, or a volume with no recycle bin, threw here AFTER the
+      // extraction had succeeded, and the catch below then trashed every file
+      // the archive had just produced and filed a good archive as Failed/.
+      let extracted = false;
       try {
         // Extract into current directory
         await extractZip(full, { dir: dirPath });
-        // Move original archive to trash (recoverable)
-        await trash(full);
-        addLog(`[Unzip] Extracted ${entry.name}, original moved to trash`);
+        extracted = true;
+      } catch (zipErr) {
+        addLog(`[Unzip] Could not extract ${entry.name}: ${zipErr.message}`);
+      }
+
+      if (extracted) {
+        // Move original archive to trash (recoverable). If that fails the
+        // extracted files are still good and still get synced; only the zip
+        // stays behind, and is logged.
+        try {
+          await trash(full);
+          addLog(`[Unzip] Extracted ${entry.name}, original moved to trash`);
+        } catch (trashErr) {
+          addLog(`[Unzip] Extracted ${entry.name}, but the archive could not be moved to trash: ${trashErr.message}`);
+        }
         // Rescan current directory (do not increase depth)
         await scanAndUnpack(rootPath, dirPath, depth);
-      } catch (zipErr) {
+      } else {
         // Cleanup any partially created items (STRICTLY within root) - move to trash
         let afterNames = [];
         try {
@@ -286,9 +308,27 @@ async function scanAndUnpack(rootPath, dirPath, depth) {
   }
 }
 
-async function getFilesFromFolder(folderPath) {
+/**
+ * The scan in flight, if any. The table rebuild is requested from three places
+ * (the saved folder at start-up, every sync run, Select Folder), and at
+ * start-up two of them fire 1.5 s apart. Two walks over one tree reach the same
+ * zip: the first extracts and trashes it, the second cannot find it and would
+ * file it as corrupt. A caller that arrives mid-scan gets the running scan.
+ */
+let scanInFlight = null;
+
+function getFilesFromFolder(folderPath) {
+  if (scanInFlight) return scanInFlight;
+  scanInFlight = rebuildFileTable(folderPath).finally(() => {
+    scanInFlight = null;
+  });
+  return scanInFlight;
+}
+
+async function rebuildFileTable(folderPath) {
   // Rebuild table (fresh list of files)
   filesDataTable.clear().draw();
+  rowIndexByPath.clear();
 
   // Clear tracking Set and pending batch for fresh scan
   addedFilePaths.clear();
@@ -309,16 +349,19 @@ function addNewFile(fullPath, relativeDisplay) {
   addedFilePaths.add(fullPath);
 
   // Accumulate row data for batching
-  pendingRows.push([
-    // Hidden cell with absolute path for easy lookup
-    `<span style="display:none" class="file-fullpath" data-path="${escapeHtml(
-      fullPath,
-    )}">${escapeHtml(fullPath)}</span>`,
-    // Visible name
-    `<i class="fa fa-file-text"></i>&nbsp;&nbsp; ${escapeHtml(relativeDisplay)}`,
-    // Status
-    'Not Synced',
-  ]);
+  pendingRows.push({
+    path: fullPath,
+    cells: [
+      // Hidden cell with absolute path for easy lookup
+      `<span style="display:none" class="file-fullpath" data-path="${escapeHtml(
+        fullPath,
+      )}">${escapeHtml(fullPath)}</span>`,
+      // Visible name
+      `<i class="fa fa-file-text"></i>&nbsp;&nbsp; ${escapeHtml(relativeDisplay)}`,
+      // Status
+      'Not Synced',
+    ],
+  });
 
   // Flush batch when reaching BATCH_SIZE
   if (pendingRows.length >= BATCH_SIZE) {
@@ -332,7 +375,9 @@ function addNewFile(fullPath, relativeDisplay) {
  */
 function flushPendingRows() {
   if (pendingRows.length === 0) return;
-  pendingRows.forEach((row) => filesDataTable.row.add(row));
+  pendingRows.forEach((row) => {
+    rowIndexByPath.set(row.path, filesDataTable.row.add(row.cells).index());
+  });
   filesDataTable.draw(false);
   pendingRows = [];
 }
@@ -426,14 +471,10 @@ ipcRenderer.on('sync:updateStatus', async function (event, data) {
   if (!isPathInside(rootResolved, fileResolved)) {
     addLog(`[Guard] Skip moving outside root: ${absoluteFilePath}`);
   } else {
-    const escapedFilePath = escapeHtml(absoluteFilePath);
-    const rowIndexes = filesDataTable
-      .rows()
-      .indexes()
-      .filter(function (value) {
-        const rowData = filesDataTable.row(value).data();
-        return rowData[0].includes(escapedFilePath);
-      });
+    // O(1): the index was recorded when the row was added during the scan. Rows
+    // are keyed by the resolved root, main.js sends the path as configured; the
+    // two differ only through a symlinked or differently-cased root.
+    const rowIdx = rowIndexByPath.get(absoluteFilePath) ?? rowIndexByPath.get(fileResolved);
 
     // Move the settled file into Archived or Failed, keeping its relative path.
     // Only the file itself moves — never its folder. Moving the whole top-level
@@ -473,8 +514,7 @@ ipcRenderer.on('sync:updateStatus', async function (event, data) {
       }
     }
 
-    if (rowIndexes && rowIndexes.length > 0) {
-      const rowIdx = rowIndexes[0];
+    if (rowIdx !== undefined) {
       const rowData = filesDataTable.row(rowIdx).data();
       // `label` is the server's word for the file when there is one ("Already on
       // server", "Rejected by server"); `status` stays the move selector above.

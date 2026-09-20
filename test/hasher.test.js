@@ -34,6 +34,7 @@ test('hashAll groups paths by content: two copies of one file are one entry with
   assert.equal(grouped.fileName, 'M_1.DDD');
   assert.deepEqual(grouped.paths, [original, copy]);
   assert.equal(grouped.hash, await hashFile(original));
+  assert.equal(grouped.size, Buffer.byteLength('same bytes'));
 });
 
 test('hashAll skips a file it cannot read, reports it, and hashes the rest', async () => {

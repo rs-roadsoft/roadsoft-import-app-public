@@ -1,9 +1,6 @@
 {
   "name": "roadsoft",
   "version": "2.2.0",
-  "engines": {
-    "node": ">=21"
-  },
   "description": "Project to sync file to roadsoft server",
   "main": "main.js",
   "scripts": {
@@ -16,7 +13,7 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "generate:spec": "node scripts/generate-spec.js",
-    "test": "node --test 'test/*.test.js'"
+    "test": "node --test"
   },
   "lint-staged": {
     "**/*.{js,ts,jsx,tsx,css,scss,md,json,html}": "prettier --write --ignore-path .prettierignore --ignore-unknown"
