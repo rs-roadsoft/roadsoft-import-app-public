@@ -88,3 +88,10 @@ test('hashCheck refuses a 200 whose body is not the results list, so a proxy pag
   await assert.rejects(api.hashCheck(['aa']), (error) => error.unexpectedBody === true);
   assert.equal(calls.length, 1);
 });
+
+test('hashCheck refuses a 200 whose results is present but not a list', async () => {
+  const { request } = fakeRequest(() => ({ results: {} }));
+  const api = createApi({ ...options, request });
+
+  await assert.rejects(api.hashCheck(['aa']), (error) => error.unexpectedBody === true);
+});

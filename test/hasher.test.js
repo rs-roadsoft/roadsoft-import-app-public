@@ -64,3 +64,16 @@ test('hashAll names the upload after the shortest copy name, whatever the walk o
   assert.equal(entry.fileName, 'M_1.DDD');
   assert.deepEqual(entry.paths, [copy, original]);
 });
+
+test('hashAll breaks a tie between same-length names alphabetically, whatever the walk order', async () => {
+  const dir = tempDir();
+  const later = path.join(dir, 'M_2.DDD');
+  const earlier = path.join(dir, 'sub', 'M_1.DDD');
+  fs.mkdirSync(path.dirname(earlier));
+  fs.writeFileSync(later, 'same bytes');
+  fs.writeFileSync(earlier, 'same bytes');
+
+  const [entry] = await hashAll([later, earlier]); // M_2 is walked first
+
+  assert.equal(entry.fileName, 'M_1.DDD');
+});

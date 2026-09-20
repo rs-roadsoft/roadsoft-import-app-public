@@ -11,7 +11,8 @@ const FormData = require('form-data');
 // TODO: enable auto updater after setting up code signing key
 // const { autoUpdater } = require('electron-updater');
 const log = require('electron-log');
-// 1 MB with one rotation (the default) is a couple of days of hourly runs.
+// electron-log's default is 1 MB with one rotation — a couple of days of
+// hourly runs. 5 MB keeps about a fortnight (main.log + one main.old.log).
 log.transports.file.maxSize = 5 * 1024 * 1024;
 // A crash must leave a trace. With these handlers Electron's blocking
 // "A JavaScript error occurred in the main process" dialog is not shown
@@ -19,6 +20,7 @@ log.transports.file.maxSize = 5 * 1024 * 1024;
 process.on('uncaughtException', (error) => log.error('Uncaught exception:', error));
 process.on('unhandledRejection', (reason) => log.error('Unhandled rejection:', reason));
 const AutoLaunch = require('auto-launch');
+const util = require('util');
 
 const dbConfig = require('./models/settings');
 const setting = require('./setting');
@@ -51,8 +53,8 @@ const BULK_BATCH_BYTES = 150 * 1024 * 1024;
  * The server's per-file cap on this endpoint (`MAX_BUFFERED_FILE_BYTES`: the
  * parser's 6 MiB plus 1 MiB of slack). Multer aborts the WHOLE request with 413
  * when one part is over it — nothing in the batch is stored. Such a file is
- * therefore never sent: it goes to Failed/ with the reason, and its 99
- * neighbours upload normally.
+ * therefore never sent: it stays in the folder with the reason in its status,
+ * and its 99 neighbours upload normally.
  */
 const MAX_UPLOAD_FILE_BYTES = 7 * 1024 * 1024;
 const BULK_RETRY_DELAY_MS = 30000; // 30 seconds
@@ -73,13 +75,29 @@ let lastScheduleCheck = Date.now();
 let scheduleInterval = null; // in milliseconds
 let isWindowVisible = true;
 
-// main.log is the file support asks a customer to send. The server echoes the
-// API key back in some error messages ("API key not found. [apiKey=…]"), so
-// every line is scrubbed of the current key before it is written.
+// main.log and log.txt are the files support asks a customer to send. The
+// server echoes the API key back in some error messages ("API key not found.
+// [apiKey=…]") — precisely when a key is rejected, which is also when the key
+// in flight is NOT the stored one. So every key the app has ever held or tried
+// is scrubbed, from strings, Error objects and nested objects alike, in both
+// files.
+const secrets = new Set();
+function rememberSecret(value) {
+  if (typeof value === 'string' && value.length >= 8) secrets.add(value);
+}
+function scrub(text) {
+  let out = String(text);
+  for (const secret of secrets) out = out.split(secret).join('***');
+  return out;
+}
 log.hooks.push((message) => {
-  if (apiKey) {
-    message.data = message.data.map((part) => (typeof part === 'string' ? part.split(apiKey).join('***') : part));
-  }
+  if (!secrets.size) return message;
+  message.data = message.data.map((part) => {
+    if (typeof part === 'string') return scrub(part);
+    if (part instanceof Error) return scrub(part.stack || part.message);
+    if (part && typeof part === 'object') return scrub(util.inspect(part, { depth: 4 }));
+    return part;
+  });
   return message;
 });
 
@@ -90,6 +108,7 @@ log.hooks.push((message) => {
 async function preset() {
   // preload persisted settings from local DB so renderer can request them fast
   apiKey = await dbConfig.getSetting('api_key');
+  rememberSecret(apiKey);
   companyIdentifier = await dbConfig.getSetting('company_id');
   lastSync = await dbConfig.getSetting('last_sync');
   folderPath = await dbConfig.getSetting('folder_path');
@@ -230,7 +249,6 @@ app.whenReady().then(async () => {
       } else if (autoStartEnabled === 'false') {
         await autoLaunch.disable();
       }
-      // If null/undefined, do nothing (first run - let user decide)
     } catch (err) {
       log.error('Auto-launch error:', err.message);
     }
@@ -406,6 +424,8 @@ ipcMain.on('sync:previousSchedule', async () => {
 });
 
 async function connect(company_id, api_key) {
+  // Scrubbed from the logs from this moment on, whether or not the server accepts it.
+  rememberSecret(api_key);
   const config = {
     method: 'get',
     url: `${setting.baseUrl}/api/v2/tachofile/import/company/${company_id}/verify`,
@@ -497,24 +517,50 @@ ipcMain.on('sync:start', async () => {
 });
 
 /* ===================================== SYNC LOGIC (updated) ===================================== */
-/** `outcome` is 'Success', 'Failed' (a server verdict) or 'Not sent' (stays in the folder, retried next run). */
+/**
+ * log.txt: one line per file per run. Buffered and written once at the end of
+ * the run — a 6,000-file folder used to mean 6,000 synchronous appends on the
+ * main thread — and capped: over 5 MB the file is rotated to log.old.txt
+ * (hourly runs over a few thousand files wrote ~300 MB a year with no limit).
+ * `outcome` is 'Success', 'Failed' (a server verdict) or 'Not sent' (the file
+ * stays in the folder and is retried next run).
+ */
+const FILE_LOG_MAX_BYTES = 5 * 1024 * 1024;
+let fileLogLines = [];
+
 function logFileResult(file, outcome, note = '') {
+  const status = note ? `${outcome}: ${scrub(note)}` : outcome;
+  fileLogLines.push(`[${new Date().toLocaleString()}] (${status}) ${path.basename(file)}`);
+}
+
+function flushFileLog() {
+  if (!fileLogLines.length) return;
+  const lines = fileLogLines;
+  fileLogLines = [];
   const logFilePath = path.join(app.getPath('userData'), 'log.txt');
-
-  if (!fs.existsSync(logFilePath)) {
-    fs.writeFileSync(logFilePath, '', { flag: 'w' });
+  try {
+    if (fs.existsSync(logFilePath) && fs.statSync(logFilePath).size > FILE_LOG_MAX_BYTES) {
+      fs.renameSync(logFilePath, path.join(app.getPath('userData'), 'log.old.txt'));
+    }
+    fs.appendFileSync(logFilePath, lines.join('\n') + '\n');
+  } catch (error) {
+    log.error('Could not write log.txt:', error);
   }
+}
 
-  const status = note ? `${outcome}: ${note}` : outcome;
-  fs.appendFileSync(logFilePath, `[${new Date().toLocaleString()}] (${status}) ${path.basename(file)}\n`);
+/** The run is over, successfully or not: the window and the database both learn when. */
+function markSynced() {
+  mainWindow.webContents.send('system:update-last-sync', new Date().toLocaleString());
+  dbConfig.refreshLastSync();
 }
 
 function generateSyncSummary(stats) {
   const parts = [];
   if (stats.uploaded > 0) {
     // Files and uploads differ when copies of one file were collapsed into one request.
-    const uploads = stats.uploads !== stats.uploaded ? ` (${stats.uploads} uploaded)` : '';
-    parts.push(`Successfully synced: ${stats.uploaded}${uploads}`);
+    const duplicates = stats.uploaded - stats.uploads;
+    const detail = duplicates > 0 ? ` (${stats.uploads} uploads, ${duplicates} duplicates)` : '';
+    parts.push(`Successfully synced: ${stats.uploaded}${detail}`);
   }
   if (stats.alreadyOnServer > 0) parts.push(`Already on server: ${stats.alreadyOnServer}`);
   if (stats.rejected > 0) parts.push(`Rejected by server: ${stats.rejected}`);
@@ -581,23 +627,47 @@ function waitForRenderer(channel, fallbackMs) {
     };
     const timer = setTimeout(() => {
       ipcMain.removeListener(channel, onEvent);
-      log.warn(`Renderer did not report ${channel} within ${fallbackMs / 1000}s; continuing`);
       resolve(false);
     }, fallbackMs);
     ipcMain.once(channel, onEvent);
   });
 }
 
+/** How long a run waits for the renderer to finish rebuilding the file list (with any zip extraction). */
+const FILES_READY_FALLBACK_MS = 5 * 60_000;
+
 async function runSync(folder) {
+  try {
+    await runSyncInner(folder);
+  } finally {
+    flushFileLog();
+  }
+}
+
+/** Rows were flipped to "Synchronizing"; a run that stops early flips them back. */
+function postpone(message) {
+  sendLog(message);
+  mainWindow.webContents.send('sync:changeStatusToIdle');
+}
+
+async function runSyncInner(folder) {
   const startedAt = Date.now();
 
   // Ask the renderer to rebuild its file table. That pass also extracts any
   // zip archives, so the folder is read only once the renderer says it is
   // done — a fixed two-second wait used to let a still-extracting file be
   // hashed and uploaded half-written.
-  const filesReady = waitForRenderer('sync:filesReady', 60_000);
+  const filesReady = waitForRenderer('sync:filesReady', FILES_READY_FALLBACK_MS);
   mainWindow.webContents.send('sync:updateFiles');
-  await filesReady;
+  if (!(await filesReady)) {
+    // The rebuild (and any zip extraction) is still running. Reading the folder
+    // now would hash a file that is still being written; the next run's request
+    // joins the running scan and waits for it properly.
+    sendLog(
+      `The file list was still being rebuilt after ${FILES_READY_FALLBACK_MS / 60_000} minutes; this run is skipped and the next one will wait for it.`,
+    );
+    return;
+  }
   mainWindow.webContents.send('sync:changeStatusToProcessing');
   sendLog('Processing sync..');
 
@@ -607,7 +677,7 @@ async function runSync(folder) {
   if (filesToSync.length === 0) {
     sendLog('No files to sync');
     // An idle folder is a completed run, not a stall: "Last Sync at" advances.
-    mainWindow.webContents.send('system:update-last-sync', new Date().toLocaleString());
+    markSynced();
     return;
   }
 
@@ -619,10 +689,10 @@ async function runSync(folder) {
     sendLog(`Skipped this run, could not read ${filePath}: ${error.code ?? error.message}`);
   });
   if (entries.length === 0) {
-    sendLog(
+    postpone(
       unreadable ? `No readable files to sync (${unreadable} unreadable, retry next run)` : 'No readable files to sync',
     );
-    mainWindow.webContents.send('system:update-last-sync', new Date().toLocaleString());
+    markSynced();
     return;
   }
 
@@ -643,17 +713,21 @@ async function runSync(folder) {
     // out a 404 — a server without hash-check would otherwise look like a
     // network problem for ever.
     if (error?.response?.status === 404) {
-      sendLog(
+      postpone(
         `This server has no hash-check endpoint (HTTP 404); nothing is uploaded until it does: ${describeError(error)}`,
       );
     } else if (error?.unexpectedBody) {
-      sendLog(
+      postpone(
         `The server's answer was not a file list (a proxy or a login page in the way?), sync postponed: ${error.message}`,
       );
     } else if (error?.response) {
-      sendLog(`Server refused the hash check, sync postponed: ${describeError(error)}`);
+      postpone(`Server refused the hash check, sync postponed: ${describeError(error)}`);
+    } else if (error?.request) {
+      postpone(`Server unreachable, sync postponed: ${describeError(error)}`);
     } else {
-      sendLog(`Server unreachable, sync postponed: ${describeError(error)}`);
+      // Neither an answer nor a failed request: a bug in this code, not the network.
+      log.error('Sync failed before the upload:', error);
+      postpone(`Sync failed with an internal error, see main.log: ${error?.message ?? error}`);
     }
     return;
   }
@@ -693,17 +767,24 @@ async function runSync(folder) {
   // 4. Upload the rest — one path per entry, at most 100 files and 150 MiB per
   //    request. A file over the server's per-file cap is not sent at all: the
   //    server would answer 413 for the whole request and nothing in it would be
-  //    stored, so the batch would be offered again next run, for ever.
+  //    stored, so the batch would be offered again next run, for ever. It is
+  //    NOT moved to Failed/ either — that folder is for the server's verdicts,
+  //    and this cap is a constant compiled into the client. Should the server
+  //    ever accept larger files, a file left in place is picked up by the next
+  //    version; one filed under Failed/ would have to be moved back by hand.
   const oversized = plan.toUpload.filter((entry) => entry.size > MAX_UPLOAD_FILE_BYTES);
   for (const entry of oversized) {
     const mib = (entry.size / (1024 * 1024)).toFixed(1);
-    sendLog(`Rejected, larger than the server accepts: ${entry.fileName} (${mib} MiB, limit 7 MiB)`);
-    reportEntry(entry, syncStats, 'rejected', {
+    sendLog(`Not sent, larger than the server accepts: ${entry.fileName} (${mib} MiB, limit 7 MiB)`);
+    reportEntry(entry, syncStats, 'notSent', {
       code: 413,
       status: 'Not Synced',
-      label: `Rejected — ${mib} MiB, larger than the server accepts (7 MiB)`,
+      move: false,
+      label: `Not synced — ${mib} MiB, larger than the server accepts (7 MiB)`,
     });
-    entry.paths.forEach((filePath) => logFileResult(filePath, 'Failed', `${mib} MiB, larger than the server accepts`));
+    entry.paths.forEach((filePath) =>
+      logFileResult(filePath, 'Not sent', `${mib} MiB, larger than the server accepts`),
+    );
   }
   const batches = batchForUpload(
     plan.toUpload.filter((entry) => entry.size <= MAX_UPLOAD_FILE_BYTES),
@@ -711,7 +792,32 @@ async function runSync(folder) {
   );
 
   for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
-    const batch = batches[batchIndex];
+    // The size was measured when the file was hashed — minutes ago on a large
+    // folder. A file still being copied in, or rewritten, has changed since;
+    // its declared Content-Length would cut the upload short (or stall it), and
+    // its md5 is stale anyway. Measured again here; a changed file waits.
+    const batch = [];
+    for (const entry of batches[batchIndex]) {
+      let size = null;
+      try {
+        ({ size } = fs.statSync(entry.paths[0]));
+      } catch (error) {
+        // gone or unreadable: same treatment as a file that changed
+      }
+      if (size === entry.size) {
+        batch.push(entry);
+      } else {
+        sendLog(`Changed on disk since it was checked, not sent this run: ${entry.fileName}`);
+        reportEntry(entry, syncStats, 'notSent', {
+          code: 0,
+          status: 'Not Synced',
+          move: false,
+          label: 'Not synced — file changed while syncing (retry next run)',
+        });
+        entry.paths.forEach((filePath) => logFileResult(filePath, 'Not sent', 'changed on disk while syncing'));
+      }
+    }
+    if (!batch.length) continue;
 
     // Prepare FormData with files (rebuilt on retry: a stream can be read once).
     // Every part declares its length, so the request carries a Content-Length
@@ -827,8 +933,8 @@ async function runSync(folder) {
   const seconds = Math.round((Date.now() - startedAt) / 1000);
   sendLog(`${generateSyncSummary(syncStats)} (${seconds}s)`);
 
-  // tell renderer to update "last sync" timestamp in UI
-  mainWindow.webContents.send('system:update-last-sync', new Date().toLocaleString());
+  // tell renderer to update "last sync" timestamp in UI, and persist it
+  markSynced();
 }
 
 // Every line the renderer writes to its textarea (unzip, moves, guards) also

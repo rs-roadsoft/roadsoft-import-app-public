@@ -42,5 +42,11 @@ test('removeEmptyParents removes the emptied folder and its empty parents, stops
   assert.equal(fs.existsSync(leaf), false); // emptied leaf goes
   assert.equal(fs.existsSync(path.join(tmpRoot, 'vehicles')), true); // still holds notes.txt
 
-  await removeEmptyParents(path.resolve('/elsewhere/x'), tmpRoot); // outside the root: no-op, no throw
+  // outside the root: a real empty directory that must survive untouched
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'rs-outside-'));
+  const outsideLeaf = path.join(outside, 'empty');
+  fs.mkdirSync(outsideLeaf);
+  await removeEmptyParents(outsideLeaf, tmpRoot);
+  assert.equal(fs.existsSync(outsideLeaf), true);
+  assert.equal(fs.existsSync(outside), true);
 });

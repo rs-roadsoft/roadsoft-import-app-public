@@ -8,13 +8,17 @@ const extractZip = require('extract-zip');
 const trash = require('trash');
 // `__dirname` in the renderer is the folder of index.html (frontend/), so the
 // shared sync modules are one level up.
-const { moveTargetFor, removeEmptyParents } = require(path.join(__dirname, '..', 'sync', 'move-target'));
+const { moveTargetFor, removeEmptyParents } = require('../sync/move-target');
+// The walk rules — which folders are skipped, how deep, which extensions —
+// come from the same module the main process walks with, so the two can
+// never disagree about which files count.
+const gather = require('../sync/gather');
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-const MAX_SCAN_DEPTH = 10;
+const MAX_SCAN_DEPTH = gather.MAX_SCAN_DEPTH;
 
-const DIRS = Object.freeze({ ARCHIVED: 'Archived', FAILED: 'Failed' });
-const EXT = Object.freeze({ ZIP: '.zip', DDD: '.ddd', ESM: '.esm' });
+const DIRS = gather.DIRS;
+const EXT = Object.freeze({ ZIP: '.zip', ...gather.EXT });
 const BATCH_SIZE = 100;
 
 let connected = false;
@@ -37,6 +41,15 @@ $('.dataTables_length').addClass('bs-select');
 
 addLog('Welcome to RoadSoft File Sync Utility');
 
+// Async IPC handlers above are never awaited by Electron: a rejection inside
+// one used to vanish. Every such failure now lands in the window and main.log.
+window.addEventListener('unhandledrejection', (event) => {
+  addLog(`Unhandled error in the window: ${event.reason?.stack ?? event.reason?.message ?? event.reason}`);
+});
+window.addEventListener('error', (event) => {
+  addLog(`Error in the window: ${event.error?.stack ?? event.message}`);
+});
+
 // ============================ Initial settings ============================
 ipcRenderer.send('dbConfig:getPreset');
 
@@ -52,7 +65,7 @@ ipcRenderer.on('dbConfig:setPreset', (e, data) => {
     $(`#trigger option[value='${data.syncSchedule}']`).attr('selected', 'selected');
   }
   if (data.folderPath) {
-    getFilesFromFolder(data.folderPath);
+    getFilesFromFolder(data.folderPath).catch((err) => addLog(`Error scanning folder: ${err?.message}`));
   }
 });
 
@@ -63,6 +76,16 @@ setTimeout(() => {
 
 ipcRenderer.on('sync:changeStatusToProcessing', () => {
   changeStatusToProcessing();
+});
+
+// A run that stopped before any verdict (server unreachable, nothing readable)
+// leaves the spinners it started; put those rows back to "Not Synced".
+ipcRenderer.on('sync:changeStatusToIdle', () => {
+  filesDataTable.rows((idx, data) => {
+    if (/Synchro/i.test(String(data[2]))) {
+      filesDataTable.row(idx).data([data[0], data[1], 'Not Synced']).draw(false);
+    }
+  });
 });
 
 // =============================== Connect =================================
@@ -124,7 +147,7 @@ $('#select-folder').on('click', async function () {
     const folderPath = pathDlg.filePaths[0];
 
     $('#folder-path').text(folderPath);
-    getFilesFromFolder(folderPath);
+    getFilesFromFolder(folderPath).catch((err) => addLog(`Error scanning folder: ${err?.message}`));
     ipcRenderer.send('dbConfig:setFolderPath', folderPath);
   }
 });
@@ -460,6 +483,16 @@ async function removePathRecursiveSyncSafe(targetPath, rootGuard) {
  * - overwrite behavior is atomic: delete destination first, with root guard
  */
 ipcRenderer.on('sync:updateStatus', async function (event, data) {
+  movesInFlight += 1;
+  try {
+    await applyStatus(data);
+  } finally {
+    movesInFlight -= 1;
+    reportMoveFailuresIfDone();
+  }
+});
+
+async function applyStatus(data) {
   const absoluteFilePath = data.fileName;
   const rootFolder = $('#folder-path').text();
 
@@ -483,10 +516,9 @@ ipcRenderer.on('sync:updateStatus', async function (event, data) {
     // process still streamed the next batch from inside it, or it succeeded and
     // the later batches failed with ENOENT, their files stranded in Archived/.
     const targetType = data.status === 'Synced' ? DIRS.ARCHIVED : DIRS.FAILED;
+    // Archived/ and Failed/ themselves exist since the scan (`ensureSpecialFolders`);
+    // the destination's own folder chain is created, inside the try, below.
     const targetRootDir = path.join(rootResolved, targetType);
-    if (!fs.existsSync(targetRootDir)) {
-      fs.mkdirSync(targetRootDir);
-    }
 
     // `move: false` — the request itself failed or the server's answer was not
     // understood, so the file has no verdict yet: it stays in the folder and is
@@ -494,23 +526,32 @@ ipcRenderer.on('sync:updateStatus', async function (event, data) {
     if (data.move !== false && fs.existsSync(fileResolved)) {
       const target = moveTargetFor(rootResolved, fileResolved, targetRootDir);
 
-      // Guard 2: destination must be inside targetRootDir (realpath-based, symlink-safe)
-      if (target && isPathInside(targetRootDir, target.destFilePath)) {
-        fs.mkdirSync(path.dirname(target.destFilePath), { recursive: true });
-        // Ensure overwrite semantics on all platforms
-        if (fs.existsSync(target.destFilePath)) {
-          await removePathRecursiveSyncSafe(target.destFilePath, rootResolved);
-        }
+      if (!target) {
+        addLog(`[Guard] Refuse to move: ${fileResolved} is the root or lies outside it`);
+        noteMoveFailure();
+      } else if (!isPathInside(targetRootDir, target.destFilePath)) {
+        // Guard 2: destination must be inside targetRootDir (realpath-based, symlink-safe)
+        addLog(`[Guard] Refuse to move file outside target dir: ${target.destFilePath}`);
+        noteMoveFailure();
+      } else {
+        // Everything that touches the disk is inside the try: a mkdir that
+        // throws (a path over Windows' 260-character limit once `Archived\` is
+        // prepended, EACCES, ENOSPC) used to escape this async handler as an
+        // unhandled rejection — no log line, no status, the row spinning for ever.
         try {
+          fs.mkdirSync(path.dirname(target.destFilePath), { recursive: true });
+          // Ensure overwrite semantics on all platforms
+          if (fs.existsSync(target.destFilePath)) {
+            await removePathRecursiveSyncSafe(target.destFilePath, rootResolved);
+          }
           await fs.promises.rename(fileResolved, target.destFilePath);
           // The folder the file came from goes too once it is empty — one folder
           // per driver is a common layout, and it vanished on sync in earlier versions.
           await removeEmptyParents(path.dirname(fileResolved), rootResolved);
         } catch (err) {
-          addLog(`Error moving file: ${err?.message}`);
+          addLog(`Error moving file ${fileResolved}: ${err?.message}`);
+          noteMoveFailure();
         }
-      } else {
-        addLog(`[Guard] Refuse to move file outside target dir: ${fileResolved}`);
       }
     }
 
@@ -524,15 +565,43 @@ ipcRenderer.on('sync:updateStatus', async function (event, data) {
         .draw(false);
     }
   }
-});
+}
 
 // ================================ System logs =============================
 ipcRenderer.on('system:log', function (event, data) {
   addLog(data, false);
 });
 
+/**
+ * Moves happen here, after the main process has already printed its summary:
+ * a file that could not be moved was reported "Successfully synced" with
+ * nothing anywhere saying it is still in the folder — the silence RS-7317 sat
+ * behind. Failures are counted per run and printed as one line once the run's
+ * last move has finished; the line reaches main.log through `addLog`.
+ */
+let moveFailures = 0;
+let movesInFlight = 0;
+let runEnded = false;
+
+function noteMoveFailure() {
+  moveFailures += 1;
+}
+
+function reportMoveFailuresIfDone() {
+  if (!runEnded || movesInFlight > 0) return;
+  if (moveFailures > 0) {
+    addLog(`Could not move ${moveFailures} file(s) — they stay in the folder; see the lines above for the reasons`);
+  }
+  moveFailures = 0;
+  runEnded = false;
+}
+
 ipcRenderer.on('system:update-last-sync', function (event, data) {
   $('#last-sync').text(data);
+  // Sent after the last status of the run: the move report can go out once
+  // the moves still in flight have finished.
+  runEnded = true;
+  reportMoveFailuresIfDone();
 });
 
 // ============================== Quick open links ==========================

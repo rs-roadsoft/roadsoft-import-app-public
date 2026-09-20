@@ -13,6 +13,7 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "generate:spec": "node scripts/generate-spec.js",
+    "pretest": "node -e \"if (+process.versions.node.split('.')[0] < 21) { console.error('The tests need Node 21 or newer (the app itself runs on the Node bundled with Electron); found ' + process.version); process.exit(1) }\"",
     "test": "node --test"
   },
   "lint-staged": {
