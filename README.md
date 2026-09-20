@@ -21,7 +21,9 @@ It provides automatic sync scheduling, local configuration storage (SQLite), and
 - **Post-sync handling:**  
   — each synced `.ddd`/`.esm` file is moved **on its own** to **Archived**, keeping its relative path (a file from
   `vehicles/AB-12-CD/` lands in `Archived/vehicles/AB-12-CD/`); the folder it came from stays where it is;  
-  — failed items are moved to **Failed** the same way
+  — files the server has permanently rejected are moved to **Failed** the same way;  
+  — a file that could not be sent (network error, server error) **stays in the folder** and is offered again on
+  the next run — `Failed/` holds server verdicts and corrupted archives only
 - Supports automatic scheduled sync (every **1h / 12h / 24h** or **on app start**)
 - Local settings stored in **SQLite** database (Company ID, API key, folder, schedule, start-up options); auto-start is on by default and can be switched off in the app
 - Minimize to tray and **auto-launch** on system startup

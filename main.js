@@ -66,6 +66,16 @@ let lastScheduleCheck = Date.now();
 let scheduleInterval = null; // in milliseconds
 let isWindowVisible = true;
 
+// main.log is the file support asks a customer to send. The server echoes the
+// API key back in some error messages ("API key not found. [apiKey=…]"), so
+// every line is scrubbed of the current key before it is written.
+log.hooks.push((message) => {
+  if (apiKey) {
+    message.data = message.data.map((part) => (typeof part === 'string' ? part.split(apiKey).join('***') : part));
+  }
+  return message;
+});
+
 // TODO: enable auto updater after setting up code signing key
 // autoUpdater.autoDownload = false;
 // autoUpdater.autoInstallOnAppQuit = true;
@@ -480,23 +490,29 @@ ipcMain.on('sync:start', async () => {
 });
 
 /* ===================================== SYNC LOGIC (updated) ===================================== */
-function logFileResult(file, success, note = '') {
+/** `outcome` is 'Success', 'Failed' (a server verdict) or 'Not sent' (stays in the folder, retried next run). */
+function logFileResult(file, outcome, note = '') {
   const logFilePath = path.join(app.getPath('userData'), 'log.txt');
 
   if (!fs.existsSync(logFilePath)) {
     fs.writeFileSync(logFilePath, '', { flag: 'w' });
   }
 
-  const status = success ? (note ? `Success: ${note}` : 'Success') : `Failed: ${note}`;
+  const status = note ? `${outcome}: ${note}` : outcome;
   fs.appendFileSync(logFilePath, `[${new Date().toLocaleString()}] (${status}) ${path.basename(file)}\n`);
 }
 
 function generateSyncSummary(stats) {
   const parts = [];
-  if (stats.uploaded > 0) parts.push(`Successfully synced: ${stats.uploaded}`);
+  if (stats.uploaded > 0) {
+    // Files and uploads differ when copies of one file were collapsed into one request.
+    const uploads = stats.uploads !== stats.uploaded ? ` (${stats.uploads} uploaded)` : '';
+    parts.push(`Successfully synced: ${stats.uploaded}${uploads}`);
+  }
   if (stats.alreadyOnServer > 0) parts.push(`Already on server: ${stats.alreadyOnServer}`);
   if (stats.rejected > 0) parts.push(`Rejected by server: ${stats.rejected}`);
-  if (stats.failed > 0) parts.push(`Failed: ${stats.failed}`);
+  if (stats.unknown > 0) parts.push(`Unknown server answer, skipped: ${stats.unknown}`);
+  if (stats.notSent > 0) parts.push(`Not sent, retry next run: ${stats.notSent}`);
   return parts.length ? `${parts.join(' | ')} files` : 'Nothing to sync';
 }
 
@@ -514,6 +530,13 @@ function reportEntry(entry, stats, key, payload) {
   }
 }
 
+/** `true` while a run is in flight. Runs are triggered from several places (the
+ * hourly interval, resume from sleep, Sync Now, the start-up trigger); two at
+ * once would hash, ask and upload the same files twice and race each other on
+ * the moves. There is deliberately no request timeout, so a stalled run can
+ * outlast the interval — the guard is what keeps the next tick from stacking. */
+let syncInProgress = false;
+
 async function syncFolder(folder) {
   if (!folder) {
     sendLog('No folder selected for sync.');
@@ -525,12 +548,48 @@ async function syncFolder(folder) {
     sendLog(`Error: Selected folder does not exist: ${folder}`);
     return;
   }
+  if (syncInProgress) {
+    sendLog('A sync is already running; this trigger is skipped.');
+    return;
+  }
+  syncInProgress = true;
+  try {
+    await runSync(folder);
+  } finally {
+    syncInProgress = false;
+  }
+}
+
+/**
+ * Resolves when the renderer reports `channel`, or after `fallbackMs` if it
+ * never does (window gone, renderer stuck) — the run must not hang on the UI.
+ * The listener is registered BEFORE the request that triggers the reply.
+ */
+function waitForRenderer(channel, fallbackMs) {
+  return new Promise((resolve) => {
+    const onEvent = () => {
+      clearTimeout(timer);
+      resolve(true);
+    };
+    const timer = setTimeout(() => {
+      ipcMain.removeListener(channel, onEvent);
+      log.warn(`Renderer did not report ${channel} within ${fallbackMs / 1000}s; continuing`);
+      resolve(false);
+    }, fallbackMs);
+    ipcMain.once(channel, onEvent);
+  });
+}
+
+async function runSync(folder) {
   const startedAt = Date.now();
 
-  // ask renderer to rebuild its file table (will also trigger unzip logic there)
+  // Ask the renderer to rebuild its file table. That pass also extracts any
+  // zip archives, so the folder is read only once the renderer says it is
+  // done — a fixed two-second wait used to let a still-extracting file be
+  // hashed and uploaded half-written.
+  const filesReady = waitForRenderer('sync:filesReady', 60_000);
   mainWindow.webContents.send('sync:updateFiles');
-
-  await wait(2000);
+  await filesReady;
   mainWindow.webContents.send('sync:changeStatusToProcessing');
   sendLog('Processing sync..');
 
@@ -539,6 +598,8 @@ async function syncFolder(folder) {
 
   if (filesToSync.length === 0) {
     sendLog('No files to sync');
+    // An idle folder is a completed run, not a stall: "Last Sync at" advances.
+    mainWindow.webContents.send('system:update-last-sync', new Date().toLocaleString());
     return;
   }
 
@@ -549,6 +610,7 @@ async function syncFolder(folder) {
   });
   if (entries.length === 0) {
     sendLog('No readable files to sync');
+    mainWindow.webContents.send('system:update-last-sync', new Date().toLocaleString());
     return;
   }
 
@@ -565,25 +627,51 @@ async function syncFolder(folder) {
   } catch (error) {
     // Without the answer nothing may be sent — uploading blind is the loop this
     // check exists to stop. Files stay where they are; the next run asks again.
-    sendLog(`Server unreachable, sync postponed: ${describeError(error)}`);
+    // An HTTP answer is not "unreachable": say what the server said, and call
+    // out a 404 — a server without hash-check would otherwise look like a
+    // network problem for ever.
+    if (error?.response?.status === 404) {
+      sendLog(
+        `This server has no hash-check endpoint (HTTP 404); nothing is uploaded until it does: ${describeError(error)}`,
+      );
+    } else if (error?.response) {
+      sendLog(`Server refused the hash check, sync postponed: ${describeError(error)}`);
+    } else {
+      sendLog(`Server unreachable, sync postponed: ${describeError(error)}`);
+    }
     return;
   }
   const plan = planUpload(entries, answers);
   sendLog(
     `Already on server: ${plan.alreadyImported.length}, rejected by server: ${plan.rejected.length}, to upload: ${plan.toUpload.length}`,
   );
+  if (plan.unknown.length) {
+    const statuses = [...new Set(plan.unknown.map((entry) => entry.status))].join(', ');
+    sendLog(
+      `${plan.unknown.length} file(s) skipped this run: the server answered with a status this version does not know (${statuses}). Update the application.`,
+    );
+  }
 
-  const syncStats = { uploaded: 0, alreadyOnServer: 0, rejected: 0, failed: 0 };
+  const syncStats = { uploaded: 0, uploads: 0, alreadyOnServer: 0, rejected: 0, unknown: 0, notSent: 0 };
 
   // 3. Files the server already holds go to Archived/ without an upload; files it
   //    has permanently refused go to Failed/, with the server's verdict as the label.
   for (const entry of plan.alreadyImported) {
     reportEntry(entry, syncStats, 'alreadyOnServer', { code: 200, status: 'Synced', label: 'Already on server' });
-    entry.paths.forEach((filePath) => logFileResult(filePath, true, 'already on server'));
+    entry.paths.forEach((filePath) => logFileResult(filePath, 'Success', 'already on server'));
   }
   for (const entry of plan.rejected) {
     reportEntry(entry, syncStats, 'rejected', { code: 200, status: 'Not Synced', label: 'Rejected by server' });
-    entry.paths.forEach((filePath) => logFileResult(filePath, false, 'rejected by server'));
+    entry.paths.forEach((filePath) => logFileResult(filePath, 'Failed', 'rejected by server'));
+  }
+  for (const entry of plan.unknown) {
+    reportEntry(entry, syncStats, 'unknown', {
+      code: 200,
+      status: 'Not Synced',
+      move: false,
+      label: `Not synced — unknown server answer (${entry.status})`,
+    });
+    entry.paths.forEach((filePath) => logFileResult(filePath, 'Not sent', `unknown server answer ${entry.status}`));
   }
 
   // 4. Upload the rest — one path per entry, 100 per request. Unchanged from
@@ -625,8 +713,9 @@ async function syncFolder(folder) {
         if (response.data && response.data.jobId) {
           // Success — update status for all files in batch
           for (const entry of batch) {
+            syncStats.uploads += 1;
             reportEntry(entry, syncStats, 'uploaded', { code: 200, message: 'Synced successfully', status: 'Synced' });
-            entry.paths.forEach((filePath) => logFileResult(filePath, true));
+            entry.paths.forEach((filePath) => logFileResult(filePath, 'Success'));
           }
         }
         shouldExitRetryLoop = true;
@@ -639,26 +728,39 @@ async function syncFolder(folder) {
           await delay(BULK_RETRY_DELAY_MS);
           formData = buildForm();
         } else {
-          // Other error — mark entire batch as failed
-          log.error(`Batch ${batchIndex + 1}/${batches.length} failed: ${describeError(error)}`);
+          // Other error — the request failed, so the server never saw these
+          // bytes. The files STAY in the folder and are offered again next run;
+          // a Failed/ move here would retire, for good, files the server could
+          // not have recorded and so can never recover. Failed/ is for a server
+          // verdict on the bytes (plan.rejected) and for corrupt archives only.
+          const reason = describeError(error);
+          log.error(`Batch ${batchIndex + 1}/${batches.length} not sent: ${reason}`);
           for (const entry of batch) {
-            reportEntry(entry, syncStats, 'failed', {
+            reportEntry(entry, syncStats, 'notSent', {
               code: error.response?.status || 500,
               message: error.message || 'Error occurred by API',
               status: 'Not Synced',
+              move: false,
+              label: `Not synced — ${reason} (retry next run)`,
             });
-            entry.paths.forEach((filePath) => logFileResult(filePath, false, error.message));
+            entry.paths.forEach((filePath) => logFileResult(filePath, 'Not sent', reason));
           }
           shouldExitRetryLoop = true; // Exit retry loop
         }
       }
     }
 
-    // Max retries exceeded — mark as failed
+    // Max retries exceeded — the queue is still full; the files stay and the next run tries again
     if (!shouldExitRetryLoop) {
       for (const entry of batch) {
-        reportEntry(entry, syncStats, 'failed', { code: 503, message: 'Max retries exceeded', status: 'Not Synced' });
-        entry.paths.forEach((filePath) => logFileResult(filePath, false, 'Max retries exceeded'));
+        reportEntry(entry, syncStats, 'notSent', {
+          code: 503,
+          message: 'Max retries exceeded',
+          status: 'Not Synced',
+          move: false,
+          label: 'Not synced — server queue full (retry next run)',
+        });
+        entry.paths.forEach((filePath) => logFileResult(filePath, 'Not sent', 'server queue full'));
       }
     }
 
@@ -734,14 +836,5 @@ ipcMain.on('settings:getStartupPreferences', async () => {
     startMinimized: startMinimized === 'true',
   });
 });
-
-function wait(ms) {
-  return new Promise((resolve) => {
-    setTimeout(() => {
-      console.log('Done waiting');
-      resolve(ms);
-    }, ms);
-  });
-}
 
 module.exports = { gatherSyncFiles }; // exported for potential tests

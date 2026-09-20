@@ -8,7 +8,12 @@
  */
 const axios = require('axios');
 
-/** Hashes per hash-check request — the server's per-request cap. */
+/**
+ * Hashes per hash-check request — the server's per-request cap,
+ * `MAX_IMPORT_HASH_CHECK_BATCH` in
+ * `apps/be/src/modules/tachofile-import/dto/import-hash-check-request.dto.ts`
+ * (inclusive). Not exported by the backend; when that number changes, this must follow.
+ */
 const HASH_CHECK_BATCH_SIZE = 1000;
 
 function createApi({ baseUrl, companyIdentifier, apiKey, headers, request = axios }) {

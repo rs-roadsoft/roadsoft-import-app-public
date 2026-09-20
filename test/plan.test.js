@@ -26,8 +26,27 @@ test('planUpload sorts entries by the server answer, and uploads what the server
     plan.toUpload.map((one) => one.hash),
     ['new', 'unanswered'],
   );
+  assert.deepEqual(plan.unknown, []);
+});
+
+test('planUpload never uploads on a status it does not know — a future server state must not become a storm', () => {
+  const plan = planUpload(
+    [entry('a'), entry('b')],
+    new Map([
+      ['a', 'QUARANTINED'],
+      ['b', 'NOT_IMPORTED'],
+    ]),
+  );
+
+  assert.deepEqual(
+    plan.toUpload.map((one) => one.hash),
+    ['b'],
+  );
+  assert.equal(plan.unknown.length, 1);
+  assert.equal(plan.unknown[0].hash, 'a');
+  assert.equal(plan.unknown[0].status, 'QUARANTINED');
 });
 
 test('planUpload with no entries is empty everywhere', () => {
-  assert.deepEqual(planUpload([], new Map()), { toUpload: [], alreadyImported: [], rejected: [] });
+  assert.deepEqual(planUpload([], new Map()), { toUpload: [], alreadyImported: [], rejected: [], unknown: [] });
 });

@@ -80,10 +80,20 @@ $('#connect').on('click', function () {
   ipcRenderer.send('config:authenticate', { companyIdentifier, apiKey });
 });
 
-ipcRenderer.on('sync:updateFiles', () => {
+ipcRenderer.on('sync:updateFiles', async () => {
   const folderPath = $('#folder-path').text();
-  if (folderPath) {
-    getFilesFromFolder(folderPath);
+  try {
+    if (folderPath) {
+      await getFilesFromFolder(folderPath);
+    }
+  } catch (err) {
+    addLog(`Error scanning folder: ${err?.message}`);
+  } finally {
+    // The main process waits for this before it reads the folder: the rebuild
+    // above also extracts zip archives, and a file still being written must
+    // not be hashed and uploaded half-done. Sent on every path, so a scan
+    // error cannot leave the sync waiting.
+    ipcRenderer.send('sync:filesReady');
   }
 });
 
@@ -437,7 +447,10 @@ ipcRenderer.on('sync:updateStatus', async function (event, data) {
       fs.mkdirSync(targetRootDir);
     }
 
-    if (fs.existsSync(fileResolved)) {
+    // `move: false` — the request itself failed or the server's answer was not
+    // understood, so the file has no verdict yet: it stays in the folder and is
+    // offered again next run. Only a settled file moves.
+    if (data.move !== false && fs.existsSync(fileResolved)) {
       const target = moveTargetFor(rootResolved, fileResolved, targetRootDir);
 
       // Guard 2: destination must be inside targetRootDir (realpath-based, symlink-safe)
