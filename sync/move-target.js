@@ -14,11 +14,17 @@
 const fs = require('fs');
 const path = require('path');
 
+/** Strictly inside: not the root itself, not outside it, on any platform. */
+function isStrictlyInside(root, candidate) {
+  const rel = path.relative(root, candidate);
+  return !!rel && !rel.startsWith('..') && !path.isAbsolute(rel);
+}
+
 function moveTargetFor(rootResolved, fileResolved, targetRootDir) {
-  const relFromRoot = path.relative(rootResolved, fileResolved);
-  if (!relFromRoot || relFromRoot.startsWith('..') || path.isAbsolute(relFromRoot)) {
+  if (!isStrictlyInside(rootResolved, fileResolved)) {
     return null;
   }
+  const relFromRoot = path.relative(rootResolved, fileResolved);
   return { relFromRoot, destFilePath: path.join(targetRootDir, relFromRoot) };
 }
 
@@ -34,7 +40,10 @@ function moveTargetFor(rootResolved, fileResolved, targetRootDir) {
  */
 async function removeEmptyParents(dir, rootResolved) {
   let current = dir;
-  while (current !== rootResolved && current.startsWith(rootResolved + path.sep)) {
+  // `path.relative`, not a string prefix: a root that already ends with a
+  // separator (a drive root such as `E:\`) never matched `root + sep`, so no
+  // emptied folder under it was ever removed.
+  while (isStrictlyInside(rootResolved, current)) {
     try {
       await fs.promises.rmdir(current);
     } catch (error) {
@@ -44,4 +53,21 @@ async function removeEmptyParents(dir, rootResolved) {
   }
 }
 
-module.exports = { moveTargetFor, removeEmptyParents };
+/**
+ * A destination that does not overwrite anything. `fs.rename` replaces an
+ * existing file on every platform, and the one thing this app must never do is
+ * lose a file for good: where the older copy could not go to the recycle bin,
+ * the newer one takes a numbered name beside it — `M_1 (1).DDD` — and both stay.
+ */
+function uniqueDestination(destPath) {
+  if (!fs.existsSync(destPath)) return destPath;
+  const dir = path.dirname(destPath);
+  const ext = path.extname(destPath);
+  const stem = path.basename(destPath, ext);
+  for (let n = 1; ; n += 1) {
+    const candidate = path.join(dir, `${stem} (${n})${ext}`);
+    if (!fs.existsSync(candidate)) return candidate;
+  }
+}
+
+module.exports = { moveTargetFor, removeEmptyParents, isStrictlyInside, uniqueDestination };

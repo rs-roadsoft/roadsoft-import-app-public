@@ -44,7 +44,7 @@
   "failed_purpose": "Failed files",
   "failed_contents": "Files the RoadSoft platform permanently rejected, and corrupted archives. A file that could not be sent (network or server error) stays in the sync folder and is retried on the next synchronization.",
   "note_file_processing": "Both folders are created automatically inside the selected sync folder. They are excluded from future scans, so files placed there will not be re-processed.",
-  "note_zip_trash": "After a `.zip` archive is successfully extracted, the original `.zip` file is automatically moved to the OS recycle bin and can be restored from there if needed.",
+  "note_zip_trash": "After a `.zip` archive is successfully extracted, the original `.zip` file is automatically moved to the OS recycle bin and can be restored from there if needed. Where there is no recycle bin (for example on a network share), the archive is moved to `Archived/` instead. Nothing is ever overwritten: an older file with the same name is kept and the newer one gets a numbered name.",
   "section_updates": "Updates & Maintenance",
   "autolaunch": "Auto-launch on system startup is supported and configurable within the application",
   "tray": "Minimize to system tray is supported (optional)"

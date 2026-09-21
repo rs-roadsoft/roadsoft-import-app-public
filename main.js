@@ -7,13 +7,16 @@ require('@electron/remote/main').initialize();
 const axios = require('axios');
 const path = require('path');
 const fs = require('fs');
-const FormData = require('form-data');
 // TODO: enable auto updater after setting up code signing key
 // const { autoUpdater } = require('electron-updater');
 const log = require('electron-log');
 // electron-log's default is 1 MB with one rotation — a couple of days of
 // hourly runs. 5 MB keeps about a fortnight (main.log + one main.old.log).
 log.transports.file.maxSize = 5 * 1024 * 1024;
+// One place on every platform: `<userData>/logs/main.log`. That is electron-log's
+// own default on Windows and Linux, but on macOS it wrote to ~/Library/Logs,
+// where the "Logs" link (which opens userData) did not find it.
+log.transports.file.resolvePathFn = () => path.join(app.getPath('userData'), 'logs', 'main.log');
 // A crash must leave a trace. With these handlers Electron's blocking
 // "A JavaScript error occurred in the main process" dialog is not shown
 // either — on an unattended machine that dialog froze the whole app.
@@ -29,6 +32,8 @@ const { gatherSyncFiles } = require('./sync/gather');
 const hasher = require('./sync/hasher');
 const { createApi, describeError } = require('./sync/api');
 const { planUpload, batchForUpload } = require('./sync/plan');
+const { buildUploadForm } = require('./sync/upload-form');
+const { classifyReceipt } = require('./sync/receipt');
 
 function getCustomHeaders() {
   return {
@@ -131,6 +136,14 @@ function createWindow(startMinimized = false) {
 
   mainWindow.loadFile(path.join(__dirname, 'frontend/index.html'));
 
+  // A renderer that crashed (out of memory on a huge table, a GPU fault) took
+  // the sync with it: every run waited for the file-list reply that never came
+  // and was skipped, until someone restarted the app.
+  mainWindow.webContents.on('render-process-gone', (event, details) => {
+    log.error(`Renderer process gone (${details.reason}); reloading the window`);
+    mainWindow.reload();
+  });
+
   if (startMinimized) {
     // Don't show or maximize, just hide to tray
     mainWindow.hide();
@@ -180,9 +193,9 @@ function createWindow(startMinimized = false) {
 
     if (choice === 0) {
       // Clean up timers before exit
-      if (scheduleId) {
-        clearInterval(scheduleId);
-      }
+      clearSchedule();
+      // app.exit skips every finally: the per-file lines of a run in flight would be lost
+      flushFileLog();
       app.exit(0);
     }
   });
@@ -227,7 +240,12 @@ app.whenReady().then(async () => {
   // start; this restores that default while keeping the checkbox as the opt-out.
   if (autoStartEnabled === null || autoStartEnabled === undefined) {
     autoStartEnabled = 'true';
-    await dbConfig.setSetting('auto_start_enabled', 'true');
+    try {
+      await dbConfig.setSetting('auto_start_enabled', 'true');
+    } catch (error) {
+      // A read-only or busy config.db must not leave the app without a window.
+      log.error('Could not save the auto-start default:', error);
+    }
   }
 
   log.info(
@@ -393,19 +411,20 @@ ipcMain.on('sync:previousSchedule', async () => {
   // Always try to reconnect if we have credentials (fixes "not connected" on restart)
   if (companyIdentifier && apiKey) {
     const connection = await connect(companyIdentifier, apiKey);
-    if (!connection) log.warn('Startup connect failed; the schedule is not armed until the next Connect');
+    // The schedule is armed whether or not that first connect succeeded. With
+    // auto-start the app comes up at logon, often before the network or the
+    // VPN does; a failed verify used to leave the schedule unarmed for the
+    // whole session — the app "running" in the tray and never syncing again
+    // (RS-6238). A run against a server that is still unreachable is postponed
+    // by the hash-check, so arming early costs nothing.
+    if (!connection) log.warn('Startup connect failed; the schedule is armed anyway and the next run retries');
 
-    // Only restore schedule if connection succeeded and we have a folder
-    if (connection && folderPath && scheduleTrigger) {
-      mainWindow.webContents.send('system:log', 'Sync scheduled: ' + scheduleTrigger);
+    if (folderPath && scheduleTrigger) {
+      sendLog('Sync scheduled: ' + scheduleTrigger);
 
       if (scheduleTrigger == 'application_start') {
-        if (scheduleId) {
-          try {
-            clearInterval(scheduleId);
-          } catch (error) {}
-        }
-        syncFolder(folderPath);
+        clearSchedule();
+        startupSync(folderPath);
       } else if (scheduleTrigger == '1H') {
         scheduleSyncOnHour(1);
       } else if (scheduleTrigger == '12H') {
@@ -413,15 +432,48 @@ ipcMain.on('sync:previousSchedule', async () => {
       } else if (scheduleTrigger == '24H') {
         scheduleSyncOnHour(24);
       } else {
-        if (scheduleId) {
-          try {
-            clearInterval(scheduleId);
-          } catch (error) {}
-        }
+        clearSchedule();
       }
     }
   }
 });
+
+/** How often a start-up sync that could not complete is tried again. */
+const STARTUP_RETRY_MS = 10 * 60_000;
+let startupRetryTimer = null;
+
+/**
+ * The "on app start" trigger has no next tick to fall back on. An app that
+ * boots before the network is up, or whose first scan takes longer than the
+ * file-list wait, used to sit idle until someone clicked Sync Now. Tried again
+ * every STARTUP_RETRY_MS until one run completes; a folder that does not exist
+ * is not retried, the user has to pick one.
+ */
+async function startupSync(folder) {
+  const outcome = await syncFolder(folder);
+  if (outcome === 'done' || outcome === 'invalid') return;
+  sendLog(`Start-up sync did not complete (${outcome}); trying again in ${STARTUP_RETRY_MS / 60_000} minutes`);
+  clearTimeout(startupRetryTimer);
+  startupRetryTimer = setTimeout(() => startupSync(folder), STARTUP_RETRY_MS);
+}
+
+/**
+ * Stop the armed schedule, if any, and forget it. The resume-from-sleep
+ * handler reads `scheduleId` and `scheduleInterval` to decide whether a sync
+ * was missed: a timer that was cleared but still remembered was resurrected
+ * after every sleep, hourly syncs included, on a schedule the user had set to
+ * Manual.
+ */
+function clearSchedule() {
+  if (scheduleId) {
+    clearInterval(scheduleId);
+    clearTimeout(scheduleId);
+  }
+  scheduleId = null;
+  scheduleInterval = null;
+  clearTimeout(startupRetryTimer);
+  startupRetryTimer = null;
+}
 
 async function connect(company_id, api_key) {
   // Scrubbed from the logs from this moment on, whether or not the server accepts it.
@@ -461,11 +513,7 @@ ipcMain.on('sync:schedule', async (_, trigger) => {
   await dbConfig.setSetting('sync_schedule', trigger);
   log.info(`Schedule set by user: ${trigger || 'manual'}`);
   if (trigger == 'application_start') {
-    if (scheduleId) {
-      try {
-        clearInterval(scheduleId);
-      } catch (error) {}
-    }
+    clearSchedule();
     syncFolder(folderPath);
   } else if (trigger == '1H') {
     scheduleSyncOnHour(1);
@@ -474,21 +522,13 @@ ipcMain.on('sync:schedule', async (_, trigger) => {
   } else if (trigger == '24H') {
     scheduleSyncOnHour(24);
   } else {
-    if (scheduleId) {
-      try {
-        clearInterval(scheduleId);
-      } catch (error) {}
-    }
+    clearSchedule();
   }
 });
 
 function scheduleSyncOnHour(hour) {
   // remove old task if
-  if (scheduleId) {
-    try {
-      clearInterval(scheduleId);
-    } catch (error) {}
-  }
+  clearSchedule();
 
   scheduleInterval = hour * 60 * 60 * 1000;
   lastScheduleCheck = Date.now();
@@ -535,16 +575,21 @@ function logFileResult(file, outcome, note = '') {
 
 function flushFileLog() {
   if (!fileLogLines.length) return;
-  const lines = fileLogLines;
-  fileLogLines = [];
   const logFilePath = path.join(app.getPath('userData'), 'log.txt');
+  // Rotation and append fail on their own: a log.txt held open by an editor or
+  // an antivirus refuses the rename, and the run's lines used to go with it.
   try {
     if (fs.existsSync(logFilePath) && fs.statSync(logFilePath).size > FILE_LOG_MAX_BYTES) {
       fs.renameSync(logFilePath, path.join(app.getPath('userData'), 'log.old.txt'));
     }
-    fs.appendFileSync(logFilePath, lines.join('\n') + '\n');
   } catch (error) {
-    log.error('Could not write log.txt:', error);
+    log.warn('Could not rotate log.txt, appending to it as it is:', error);
+  }
+  try {
+    fs.appendFileSync(logFilePath, fileLogLines.join('\n') + '\n');
+    fileLogLines = [];
+  } catch (error) {
+    log.error('Could not write log.txt; the lines are kept for the next flush:', error);
   }
 }
 
@@ -566,6 +611,7 @@ function generateSyncSummary(stats) {
   if (stats.rejected > 0) parts.push(`Rejected by server: ${stats.rejected}`);
   if (stats.unknown > 0) parts.push(`Unknown server answer, skipped: ${stats.unknown}`);
   if (stats.notSent > 0) parts.push(`Not sent, retry next run: ${stats.notSent}`);
+  if (stats.notStored > 0) parts.push(`Not stored by server, checked next run: ${stats.notStored}`);
   if (stats.unreadable > 0) parts.push(`Unreadable, retry next run: ${stats.unreadable}`);
   return parts.length ? `${parts.join(' | ')} files` : 'Nothing to sync';
 }
@@ -590,27 +636,51 @@ function reportEntry(entry, stats, key, payload) {
  * the moves. There is deliberately no request timeout, so a stalled run can
  * outlast the interval — the guard is what keeps the next tick from stacking. */
 let syncInProgress = false;
+let syncStartedAt = 0;
+/**
+ * The run that owns the guard. Without a request timeout a run can hang for
+ * ever on a socket that died silently — a laptop that slept mid-request, a NAT
+ * that dropped the idle connection — and the guard then turned one such hang
+ * into a permanent stop: every later tick, resume and Sync Now was "already
+ * running" until the app was restarted. A run older than STALE_RUN_MS is
+ * presumed hung: the next trigger takes the guard over, and the old run, should
+ * it ever wake up, sees it is no longer current and stops without reporting
+ * anything — the next run's hash-check settles whatever it had uploaded.
+ */
+const STALE_RUN_MS = 2 * 60 * 60 * 1000;
+let currentRunToken = 0;
 
+/**
+ * Returns how the run ended: 'done', 'postponed' (server unreachable, nothing
+ * readable), 'skipped' (file list not ready), 'busy' (another run holds the
+ * guard), 'abandoned' (taken over as hung) or 'invalid' (no usable folder).
+ */
 async function syncFolder(folder) {
   if (!folder) {
     sendLog('No folder selected for sync.');
-    return;
+    return 'invalid';
   }
 
   // Check if folder exists
   if (!fs.existsSync(folder)) {
     sendLog(`Error: Selected folder does not exist: ${folder}`);
-    return;
+    return 'invalid';
   }
   if (syncInProgress) {
-    sendLog('A sync is already running; this trigger is skipped.');
-    return;
+    const inFlightMinutes = Math.round((Date.now() - syncStartedAt) / 60_000);
+    if (Date.now() - syncStartedAt < STALE_RUN_MS) {
+      sendLog(`A sync is already running (for ${inFlightMinutes} min); this trigger is skipped.`);
+      return 'busy';
+    }
+    sendLog(`The previous sync has been running for ${inFlightMinutes} min and is presumed hung; starting a new one.`);
   }
   syncInProgress = true;
+  syncStartedAt = Date.now();
+  const token = ++currentRunToken;
   try {
-    await runSync(folder);
+    return await runSync(folder, token);
   } finally {
-    syncInProgress = false;
+    if (token === currentRunToken) syncInProgress = false;
   }
 }
 
@@ -636,9 +706,9 @@ function waitForRenderer(channel, fallbackMs) {
 /** How long a run waits for the renderer to finish rebuilding the file list (with any zip extraction). */
 const FILES_READY_FALLBACK_MS = 5 * 60_000;
 
-async function runSync(folder) {
+async function runSync(folder, token) {
   try {
-    await runSyncInner(folder);
+    return await runSyncInner(folder, token);
   } finally {
     flushFileLog();
   }
@@ -650,8 +720,16 @@ function postpone(message) {
   mainWindow.webContents.send('sync:changeStatusToIdle');
 }
 
-async function runSyncInner(folder) {
+async function runSyncInner(folder, token) {
   const startedAt = Date.now();
+  // True once a later run has taken the guard over because this one looked
+  // hung. Checked after every wait that can outlast STALE_RUN_MS; a late result
+  // is dropped rather than reported into the other run's table.
+  const abandoned = () => {
+    if (token === currentRunToken) return false;
+    log.warn(`Run ${token} was taken over as hung; its late result is discarded`);
+    return true;
+  };
 
   // Ask the renderer to rebuild its file table. That pass also extracts any
   // zip archives, so the folder is read only once the renderer says it is
@@ -664,10 +742,11 @@ async function runSyncInner(folder) {
     // now would hash a file that is still being written; the next run's request
     // joins the running scan and waits for it properly.
     sendLog(
-      `The file list was still being rebuilt after ${FILES_READY_FALLBACK_MS / 60_000} minutes; this run is skipped and the next one will wait for it.`,
+      `The file list was still being rebuilt after ${FILES_READY_FALLBACK_MS / 60_000} minutes; this run is skipped and tried again later.`,
     );
-    return;
+    return 'skipped';
   }
+  if (abandoned()) return 'abandoned';
   mainWindow.webContents.send('sync:changeStatusToProcessing');
   sendLog('Processing sync..');
 
@@ -678,7 +757,7 @@ async function runSyncInner(folder) {
     sendLog('No files to sync');
     // An idle folder is a completed run, not a stall: "Last Sync at" advances.
     markSynced();
-    return;
+    return 'done';
   }
 
   // 1. Fingerprint every file (md5 of the bytes — the digest the server derives),
@@ -686,14 +765,23 @@ async function runSyncInner(folder) {
   let unreadable = 0;
   const entries = await hasher.hashAll(filesToSync, (filePath, error) => {
     unreadable += 1;
-    sendLog(`Skipped this run, could not read ${filePath}: ${error.code ?? error.message}`);
+    const reason = error.code ?? error.message;
+    sendLog(`Skipped this run, could not read ${filePath}: ${reason}`);
+    // Its row was flipped to "Synchronizing" with the rest; without a status it
+    // kept spinning until the next run rebuilt the table.
+    mainWindow.webContents.send('sync:updateStatus', {
+      fileName: filePath,
+      status: 'Not Synced',
+      move: false,
+      label: `Not synced — could not read the file (${reason}), retry next run`,
+    });
   });
   if (entries.length === 0) {
     postpone(
       unreadable ? `No readable files to sync (${unreadable} unreadable, retry next run)` : 'No readable files to sync',
     );
     markSynced();
-    return;
+    return 'done';
   }
 
   // 2. Ask the server which of these it already knows. This is what ends a
@@ -712,7 +800,9 @@ async function runSyncInner(folder) {
     // An HTTP answer is not "unreachable": say what the server said, and call
     // out a 404 — a server without hash-check would otherwise look like a
     // network problem for ever.
-    if (error?.response?.status === 404) {
+    // A 404 WITH a codeName is the server's own answer ("company not found",
+    // a key no longer linked to it); only a bare Nest 404 means the route is missing.
+    if (error?.response?.status === 404 && !error?.response?.data?.codeName) {
       postpone(
         `This server has no hash-check endpoint (HTTP 404); nothing is uploaded until it does: ${describeError(error)}`,
       );
@@ -729,8 +819,9 @@ async function runSyncInner(folder) {
       log.error('Sync failed before the upload:', error);
       postpone(`Sync failed with an internal error, see main.log: ${error?.message ?? error}`);
     }
-    return;
+    return 'postponed';
   }
+  if (abandoned()) return 'abandoned';
   const plan = planUpload(entries, answers);
   sendLog(
     `Already on server: ${plan.alreadyImported.length}, rejected by server: ${plan.rejected.length}, to upload: ${plan.toUpload.length}`,
@@ -742,7 +833,16 @@ async function runSyncInner(folder) {
     );
   }
 
-  const syncStats = { uploaded: 0, uploads: 0, alreadyOnServer: 0, rejected: 0, unknown: 0, notSent: 0, unreadable };
+  const syncStats = {
+    uploaded: 0,
+    uploads: 0,
+    alreadyOnServer: 0,
+    rejected: 0,
+    unknown: 0,
+    notSent: 0,
+    notStored: 0,
+    unreadable,
+  };
 
   // 3. Files the server already holds go to Archived/ without an upload; files it
   //    has permanently refused go to Failed/, with the server's verdict as the label.
@@ -792,49 +892,32 @@ async function runSyncInner(folder) {
   );
 
   for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
-    // The size was measured when the file was hashed — minutes ago on a large
-    // folder. A file still being copied in, or rewritten, has changed since;
-    // its declared Content-Length would cut the upload short (or stall it), and
-    // its md5 is stale anyway. Measured again here; a changed file waits.
-    const batch = [];
-    for (const entry of batches[batchIndex]) {
-      let size = null;
-      try {
-        ({ size } = fs.statSync(entry.paths[0]));
-      } catch (error) {
-        // gone or unreadable: same treatment as a file that changed
-      }
-      if (size === entry.size) {
-        batch.push(entry);
-      } else {
+    let batch = batches[batchIndex];
+
+    // The form is built right before each attempt (a stream can be read once).
+    // Sizes are measured again there — a file that changed since it was hashed
+    // is reported and left for next run — and a zero-byte file goes in as an
+    // empty part (see sync/upload-form.js). Every part declares its length, so
+    // the request carries a Content-Length instead of streaming chunked: that
+    // header is what lets the server refuse an oversized batch before buffering
+    // it (two production out-of-memory crashes were traced to this client's
+    // chunked uploads).
+    const buildForm = () => {
+      const built = buildUploadForm(batch);
+      for (const entry of built.changed) {
         sendLog(`Changed on disk since it was checked, not sent this run: ${entry.fileName}`);
         reportEntry(entry, syncStats, 'notSent', {
-          code: 0,
           status: 'Not Synced',
           move: false,
           label: 'Not synced — file changed while syncing (retry next run)',
         });
         entry.paths.forEach((filePath) => logFileResult(filePath, 'Not sent', 'changed on disk while syncing'));
       }
-    }
-    if (!batch.length) continue;
-
-    // Prepare FormData with files (rebuilt on retry: a stream can be read once).
-    // Every part declares its length, so the request carries a Content-Length
-    // instead of streaming chunked: that header is what lets the server refuse
-    // an oversized batch before buffering it (two production out-of-memory
-    // crashes were traced to this client's chunked uploads).
-    const buildForm = () => {
-      const form = new FormData();
-      for (const entry of batch) {
-        form.append('files', fs.createReadStream(entry.paths[0]), {
-          filename: entry.fileName,
-          knownLength: entry.size,
-        });
-      }
-      return form;
+      batch = built.sent;
+      return built;
     };
-    let formData = buildForm();
+    let upload = buildForm();
+    if (!upload.form) continue;
 
     // Send with retry on queue overflow
     let retries = 0;
@@ -847,21 +930,39 @@ async function runSyncInner(folder) {
           url: `${setting.baseUrl}/api/v2/tachofile/import/company/${companyIdentifier}/bulk`,
           headers: {
             'API-KEY': apiKey,
-            ...formData.getHeaders(),
-            'Content-Length': formData.getLengthSync(),
+            ...upload.form.getHeaders(),
+            'Content-Length': upload.form.getLengthSync(),
             ...getCustomHeaders(),
           },
-          data: formData,
+          data: upload.form,
           maxContentLength: Infinity,
           maxBodyLength: Infinity,
         });
+        upload.destroy();
+        if (abandoned()) return 'abandoned';
 
         if (response.data && response.data.jobId) {
-          // Success — update status for all files in batch
-          for (const entry of batch) {
+          // The receipt names every file: a stored one carries a fileId, one the
+          // intake refused does not (sync/receipt.js). A refused file is not moved
+          // — the next run's hash-check gives the verdict — instead of being filed
+          // under Archived/ as "Synced successfully", which is where the server's
+          // refusal used to disappear.
+          const { stored, notStored } = classifyReceipt(batch, response.data);
+          for (const entry of stored) {
             syncStats.uploads += 1;
-            reportEntry(entry, syncStats, 'uploaded', { code: 200, message: 'Synced successfully', status: 'Synced' });
+            reportEntry(entry, syncStats, 'uploaded', { status: 'Synced' });
             entry.paths.forEach((filePath) => logFileResult(filePath, 'Success'));
+          }
+          for (const entry of notStored) {
+            sendLog(`Not stored by the server (refused at intake): ${entry.fileName} — checked again next run`);
+            reportEntry(entry, syncStats, 'notStored', {
+              status: 'Not Synced',
+              move: false,
+              label: 'Not stored by the server — checked again next run',
+            });
+            entry.paths.forEach((filePath) =>
+              logFileResult(filePath, 'Not stored', 'refused at intake, verdict next run'),
+            );
           }
         } else {
           // A 2xx without a receipt is not an upload the server recorded (a
@@ -871,7 +972,6 @@ async function runSyncInner(folder) {
           );
           for (const entry of batch) {
             reportEntry(entry, syncStats, 'notSent', {
-              code: response.status,
               status: 'Not Synced',
               move: false,
               label: 'Not synced — server answered without a receipt (retry next run)',
@@ -881,6 +981,10 @@ async function runSyncInner(folder) {
         }
         shouldExitRetryLoop = true;
       } catch (error) {
+        // A form that did not go out (or only partly) keeps its file handles
+        // open until destroyed; a retry builds a fresh one.
+        upload.destroy();
+        if (abandoned()) return 'abandoned';
         const codeName = error.response?.data?.codeName;
 
         if (codeName === 'file-upload/too-many-files-in-queue') {
@@ -888,7 +992,9 @@ async function runSyncInner(folder) {
           if (retries >= BULK_MAX_RETRIES) break; // no point sleeping after the last try
           sendLog(`Queue full, waiting ${BULK_RETRY_DELAY_MS / 1000}s... (${retries}/${BULK_MAX_RETRIES})`);
           await delay(BULK_RETRY_DELAY_MS);
-          formData = buildForm();
+          if (abandoned()) return 'abandoned';
+          upload = buildForm();
+          if (!upload.form) shouldExitRetryLoop = true; // every file changed while waiting
         } else {
           // Other error — the request failed, so the server never saw these
           // bytes. The files STAY in the folder and are offered again next run;
@@ -899,8 +1005,6 @@ async function runSyncInner(folder) {
           log.error(`Batch ${batchIndex + 1}/${batches.length} not sent: ${reason}`);
           for (const entry of batch) {
             reportEntry(entry, syncStats, 'notSent', {
-              code: error.response?.status || 500,
-              message: error.message || 'Error occurred by API',
               status: 'Not Synced',
               move: false,
               label: `Not synced — ${reason} (retry next run)`,
@@ -916,8 +1020,6 @@ async function runSyncInner(folder) {
     if (!shouldExitRetryLoop) {
       for (const entry of batch) {
         reportEntry(entry, syncStats, 'notSent', {
-          code: 503,
-          message: 'Max retries exceeded',
           status: 'Not Synced',
           move: false,
           label: 'Not synced — server queue full (retry next run)',
@@ -927,6 +1029,8 @@ async function runSyncInner(folder) {
     }
 
     sendLog(`Batch ${batchIndex + 1}/${batches.length} complete`);
+    // Written per batch, so an Exit or a shutdown mid-run loses at most one batch of lines.
+    flushFileLog();
   }
 
   // Final summary message
@@ -935,6 +1039,7 @@ async function runSyncInner(folder) {
 
   // tell renderer to update "last sync" timestamp in UI, and persist it
   markSynced();
+  return 'done';
 }
 
 // Every line the renderer writes to its textarea (unzip, moves, guards) also
@@ -970,22 +1075,19 @@ ipcMain.on('settings:setAutoStart', async (e, enabled) => {
       } else {
         await autoLaunch.disable();
       }
-      mainWindow.webContents.send('system:log', `Auto-start ${enabled ? 'enabled' : 'disabled'}`);
+      sendLog(`Auto-start ${enabled ? 'enabled' : 'disabled'}`);
     } catch (err) {
       log.error('Auto-launch error:', err.message);
-      mainWindow.webContents.send('system:log', `Auto-start error: ${err.message}`);
+      sendLog(`Auto-start error: ${err.message}`);
     }
   } else {
-    mainWindow.webContents.send(
-      'system:log',
-      `Auto-start ${enabled ? 'enabled' : 'disabled'} (dev mode - will work in production)`,
-    );
+    sendLog(`Auto-start ${enabled ? 'enabled' : 'disabled'} (dev mode - will work in production)`);
   }
 });
 
 ipcMain.on('settings:setStartMinimized', async (e, minimized) => {
   await dbConfig.setSetting('start_minimized', minimized ? 'true' : 'false');
-  mainWindow.webContents.send('system:log', `Start minimized ${minimized ? 'enabled' : 'disabled'}`);
+  sendLog(`Start minimized ${minimized ? 'enabled' : 'disabled'}`);
 });
 
 // Add handler to get current settings

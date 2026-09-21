@@ -8,7 +8,7 @@ const extractZip = require('extract-zip');
 const trash = require('trash');
 // `__dirname` in the renderer is the folder of index.html (frontend/), so the
 // shared sync modules are one level up.
-const { moveTargetFor, removeEmptyParents } = require('../sync/move-target');
+const { moveTargetFor, removeEmptyParents, uniqueDestination } = require('../sync/move-target');
 // The walk rules — which folders are skipped, how deep, which extensions —
 // come from the same module the main process walks with, so the two can
 // never disagree about which files count.
@@ -81,11 +81,7 @@ ipcRenderer.on('sync:changeStatusToProcessing', () => {
 // A run that stopped before any verdict (server unreachable, nothing readable)
 // leaves the spinners it started; put those rows back to "Not Synced".
 ipcRenderer.on('sync:changeStatusToIdle', () => {
-  filesDataTable.rows((idx, data) => {
-    if (/Synchro/i.test(String(data[2]))) {
-      filesDataTable.row(idx).data([data[0], data[1], 'Not Synced']).draw(false);
-    }
-  });
+  setStatusWhere((status) => /Synchro/i.test(status), 'Not Synced');
 });
 
 // =============================== Connect =================================
@@ -243,6 +239,12 @@ async function scanAndUnpack(rootPath, dirPath, depth) {
 
     const ext = path.extname(entry.name).toLowerCase();
     if (ext === EXT.ZIP) {
+      // Once per scan, whatever happens to it. The rescan below lists this folder
+      // again, and an archive that could not be taken out of it after extraction
+      // used to be extracted again, fail again and rescan again without end: the
+      // scan never finished, `sync:filesReady` never went out, every run was skipped.
+      if (handledZips.has(full)) continue;
+      handledZips.add(full);
       // snapshot before
       const beforeNames = new Set();
       try {
@@ -266,15 +268,7 @@ async function scanAndUnpack(rootPath, dirPath, depth) {
       }
 
       if (extracted) {
-        // Move original archive to trash (recoverable). If that fails the
-        // extracted files are still good and still get synced; only the zip
-        // stays behind, and is logged.
-        try {
-          await trash(full);
-          addLog(`[Unzip] Extracted ${entry.name}, original moved to trash`);
-        } catch (trashErr) {
-          addLog(`[Unzip] Extracted ${entry.name}, but the archive could not be moved to trash: ${trashErr.message}`);
-        }
+        await retireArchive(rootPath, full, entry.name);
         // Rescan current directory (do not increase depth)
         await scanAndUnpack(rootPath, dirPath, depth);
       } else {
@@ -310,7 +304,8 @@ async function scanAndUnpack(rootPath, dirPath, depth) {
         if (!fs.existsSync(failedDir)) {
           fs.mkdirSync(failedDir);
         }
-        const failedTarget = path.join(failedDir, path.basename(full));
+        // Never over an earlier archive of the same name: nothing is overwritten.
+        const failedTarget = uniqueDestination(path.join(failedDir, path.basename(full)));
 
         // Guard: both src and dst must be within root (src is in dirPath which is under root)
         if (isPathInside(rootPath, failedTarget)) {
@@ -332,26 +327,63 @@ async function scanAndUnpack(rootPath, dirPath, depth) {
 }
 
 /**
- * The scan in flight, if any. The table rebuild is requested from three places
- * (the saved folder at start-up, every sync run, Select Folder), and at
- * start-up two of them fire 1.5 s apart. Two walks over one tree reach the same
- * zip: the first extracts and trashes it, the second cannot find it and would
- * file it as corrupt. A caller that arrives mid-scan gets the running scan.
+ * Take an extracted archive out of the watched tree: to the recycle bin
+ * (recoverable), or, where there is none — a network share, a mapped drive —
+ * into Archived/ under its relative path. If even that fails the zip stays,
+ * logged; `handledZips` keeps this scan from touching it again, and the next
+ * scan tries once more.
+ */
+async function retireArchive(rootPath, zipPath, name) {
+  try {
+    await trash(zipPath);
+    addLog(`[Unzip] Extracted ${name}, original moved to trash`);
+    return;
+  } catch (trashErr) {
+    addLog(`[Unzip] Extracted ${name}, but the archive could not be moved to trash: ${trashErr.message}`);
+  }
+  try {
+    const dest = uniqueDestination(path.join(rootPath, DIRS.ARCHIVED, path.relative(rootPath, zipPath)));
+    await fs.promises.mkdir(path.dirname(dest), { recursive: true });
+    await fs.promises.rename(zipPath, dest);
+    addLog(`[Unzip] Archive moved to ${dest}`);
+  } catch (moveErr) {
+    addLog(`[Unzip] The archive could not be moved to ${DIRS.ARCHIVED}/ either, it stays in place: ${moveErr.message}`);
+  }
+}
+
+/**
+ * The scan in flight, if any, and the folder it walks. The table rebuild is
+ * requested from three places (the saved folder at start-up, every sync run,
+ * Select Folder), and at start-up two of them fire 1.5 s apart. Two walks over
+ * one tree reach the same zip: the first extracts and trashes it, the second
+ * cannot find it and would file it as corrupt. A caller asking for the folder
+ * being walked gets the running scan; a caller asking for ANOTHER folder gets
+ * a scan of that folder, queued behind the running one — it used to get the
+ * running scan and its folder was never listed or unzipped.
  */
 let scanInFlight = null;
+let scanFolder = null;
+/** Archives this scan has already dealt with (see the zip branch of scanAndUnpack). */
+let handledZips = new Set();
 
 function getFilesFromFolder(folderPath) {
-  if (scanInFlight) return scanInFlight;
-  scanInFlight = rebuildFileTable(folderPath).finally(() => {
-    scanInFlight = null;
-  });
-  return scanInFlight;
+  if (scanInFlight && scanFolder === folderPath) return scanInFlight;
+  const previous = scanInFlight ? scanInFlight.catch(() => {}) : Promise.resolve();
+  scanFolder = folderPath;
+  const tracked = previous
+    .then(() => rebuildFileTable(folderPath))
+    .finally(() => {
+      if (scanInFlight === tracked) scanInFlight = null;
+    });
+  scanInFlight = tracked;
+  return tracked;
 }
 
 async function rebuildFileTable(folderPath) {
   // Rebuild table (fresh list of files)
   filesDataTable.clear().draw();
   rowIndexByPath.clear();
+  handledZips = new Set();
 
   // Clear tracking Set and pending batch for fresh scan
   addedFilePaths.clear();
@@ -442,16 +474,26 @@ $('#sync-now').on('click', function () {
    TABLE STATUS UPDATES
    ========================================================================= */
 
+/**
+ * Set the status cell of every row whose current status passes `test`, then
+ * redraw ONCE. A redraw per row re-sorts and re-renders the whole table each
+ * time: on a 6,000-row folder that was seconds of a frozen window at the start
+ * of every run and again when a run was postponed.
+ */
+function setStatusWhere(test, statusHtml) {
+  filesDataTable.rows().every(function () {
+    const data = this.data();
+    if (test(String(data[2]))) this.data([data[0], data[1], statusHtml]);
+  });
+  filesDataTable.draw(false);
+}
+
 /** Flip all rows to "Synchronizing" at sync start (row-wise, not a full rebuild). */
 function changeStatusToProcessing() {
-  filesDataTable.rows((idx, data) => {
-    if (data[2] === 'Not Synced' || /Synchro/i.test(String(data[2]))) {
-      filesDataTable
-        .row(idx)
-        .data([data[0], data[1], '<i class="fa fa-refresh fa-spin"></i>&nbsp;&nbsp; Synchronizing'])
-        .draw(false);
-    }
-  });
+  setStatusWhere(
+    (status) => status === 'Not Synced' || /Synchro/i.test(status),
+    '<i class="fa fa-refresh fa-spin"></i>&nbsp;&nbsp; Synchronizing',
+  );
 }
 
 /**
@@ -503,12 +545,10 @@ async function applyStatus(data) {
   // Guard 1: never operate on a file outside of the chosen root
   if (!isPathInside(rootResolved, fileResolved)) {
     addLog(`[Guard] Skip moving outside root: ${absoluteFilePath}`);
+    // The folder was changed while a run was in flight: the file stays where
+    // it is, which the end-of-run line must say rather than "Successfully synced".
+    if (data.move !== false) noteMoveFailure();
   } else {
-    // O(1): the index was recorded when the row was added during the scan. Rows
-    // are keyed by the resolved root, main.js sends the path as configured; the
-    // two differ only through a symlinked or differently-cased root.
-    const rowIdx = rowIndexByPath.get(absoluteFilePath) ?? rowIndexByPath.get(fileResolved);
-
     // Move the settled file into Archived or Failed, keeping its relative path.
     // Only the file itself moves — never its folder. Moving the whole top-level
     // folder on the first settled file took every not-yet-uploaded sibling with
@@ -540,11 +580,22 @@ async function applyStatus(data) {
         // unhandled rejection — no log line, no status, the row spinning for ever.
         try {
           fs.mkdirSync(path.dirname(target.destFilePath), { recursive: true });
-          // Ensure overwrite semantics on all platforms
-          if (fs.existsSync(target.destFilePath)) {
-            await removePathRecursiveSyncSafe(target.destFilePath, rootResolved);
+          // Guard 2 above saw a path that did not exist yet, which realpath cannot
+          // follow: a junction planted inside Archived/ or Failed/ passed it. Now
+          // the folder exists and resolves through any link.
+          if (!isPathInside(targetRootDir, path.dirname(target.destFilePath))) {
+            throw new Error(`destination folder resolves outside ${targetType}/: ${path.dirname(target.destFilePath)}`);
           }
-          await fs.promises.rename(fileResolved, target.destFilePath);
+          // An older copy with the same name goes to the recycle bin first
+          // (recoverable). Where there is no bin the older copy stays and the
+          // new one takes a numbered name beside it: `rename` would otherwise
+          // overwrite it, and nothing here may be lost for good.
+          let destFilePath = target.destFilePath;
+          if (fs.existsSync(destFilePath)) {
+            await removePathRecursiveSyncSafe(destFilePath, rootResolved);
+            if (fs.existsSync(destFilePath)) destFilePath = uniqueDestination(destFilePath);
+          }
+          await fs.promises.rename(fileResolved, destFilePath);
           // The folder the file came from goes too once it is empty — one folder
           // per driver is a common layout, and it vanished on sync in earlier versions.
           await removeEmptyParents(path.dirname(fileResolved), rootResolved);
@@ -555,6 +606,12 @@ async function applyStatus(data) {
       }
     }
 
+    // Looked up AFTER the move, not before it: the table may have been rebuilt
+    // while the rename was in flight (Sync Now, Select Folder), and an index
+    // taken earlier then pointed at some other file's row — or at no row.
+    // Rows are keyed by the resolved root, main.js sends the path as configured;
+    // the two differ only through a symlinked or differently-cased root.
+    const rowIdx = rowIndexByPath.get(absoluteFilePath) ?? rowIndexByPath.get(fileResolved);
     if (rowIdx !== undefined) {
       const rowData = filesDataTable.row(rowIdx).data();
       // `label` is the server's word for the file when there is one ("Already on

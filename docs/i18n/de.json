@@ -44,7 +44,7 @@
   "failed_purpose": "Fehlgeschlagene Dateien",
   "failed_contents": "Dateien, die die RoadSoft-Plattform endgültig abgelehnt hat, und beschädigte Archive. Eine Datei, die nicht gesendet werden konnte (Netzwerk- oder Serverfehler), bleibt im Synchronisationsordner und wird bei der nächsten Synchronisierung erneut versucht.",
   "note_file_processing": "Beide Ordner werden automatisch im ausgewählten Synchronisationsordner erstellt. Sie werden bei zukünftigen Scans ausgeschlossen, sodass dort abgelegte Dateien nicht erneut verarbeitet werden.",
-  "note_zip_trash": "Nachdem ein `.zip`-Archiv erfolgreich entpackt wurde, wird die ursprüngliche `.zip`-Datei automatisch in den Papierkorb des Betriebssystems verschoben und kann bei Bedarf von dort wiederhergestellt werden.",
+  "note_zip_trash": "Nachdem ein `.zip`-Archiv erfolgreich entpackt wurde, wird die ursprüngliche `.zip`-Datei automatisch in den Papierkorb des Betriebssystems verschoben und kann bei Bedarf von dort wiederhergestellt werden. Wo kein Papierkorb verfügbar ist (zum Beispiel auf einem Netzlaufwerk), wird das Archiv stattdessen nach `Archived/` verschoben. Es wird nie etwas überschrieben: eine ältere Datei mit demselben Namen bleibt erhalten, die neuere erhält einen nummerierten Namen.",
   "section_updates": "Updates & Wartung",
   "autolaunch": "Automatischer Start beim Systemstart wird unterstützt und ist in der Anwendung konfigurierbar",
   "tray": "Minimieren in die Taskleiste wird unterstützt (optional)"

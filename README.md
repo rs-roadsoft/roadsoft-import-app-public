@@ -11,8 +11,10 @@ It provides automatic sync scheduling, local configuration storage (SQLite), and
 - Syncs tachograph files (`.ddd`, `.esm`) to RoadSoft API
 - **Subfolder support:** scans the selected folder and **all nested subfolders** (up to 10 levels)
 - **Auto-unzip archives:** automatically extracts `.zip` files, including **nested zips**  
-  — on success the original archive is removed; on failure (e.g., password/corruption) the zip is moved to **Failed** folder
-  and any partial files/folders are cleaned up
+  — on success the original archive goes to the recycle bin, or, where there is none (a network share), to **Archived**;
+  on failure (e.g., password/corruption) the zip is moved to **Failed** folder and any partial files/folders are cleaned up
+- **Nothing is ever overwritten or deleted for good:** files are only moved; an older copy with the same name goes to the
+  recycle bin first, and where there is no recycle bin the newer file takes a numbered name (`M_1 (1).DDD`) beside it
 - **Server check before upload:** every file is identified by the md5 of its bytes; before uploading, the
   app asks the RoadSoft API (`hash-check`) which files it already holds or has permanently rejected and uploads only
   the rest. Files the server already has go to **Archived** without an upload; files it rejected go to **Failed**
@@ -23,7 +25,10 @@ It provides automatic sync scheduling, local configuration storage (SQLite), and
   `vehicles/AB-12-CD/` lands in `Archived/vehicles/AB-12-CD/`); the folder it came from stays where it is;  
   — files the server has permanently rejected are moved to **Failed** the same way;  
   — a file that could not be sent (network error, server error) **stays in the folder** and is offered again on
-  the next run — `Failed/` holds server verdicts and corrupted archives only
+  the next run — `Failed/` holds server verdicts and corrupted archives only;  
+  — a file the server refused on upload (not a tachograph file, older than the company's import window) also
+  **stays in the folder** with the status _Not stored by the server_; the next run's server check moves it to
+  **Failed** as _Rejected by server_
 - Supports automatic scheduled sync (every **1h / 12h / 24h** or **on app start**)
 - Local settings stored in **SQLite** database (Company ID, API key, folder, schedule, start-up options); auto-start is on by default and can be switched off in the app
 - Minimize to tray and **auto-launch** on system startup

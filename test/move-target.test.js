@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
-const { moveTargetFor, removeEmptyParents } = require('../sync/move-target');
+const { moveTargetFor, removeEmptyParents, uniqueDestination } = require('../sync/move-target');
 
 const root = path.resolve('/watched');
 const archived = path.join(root, 'Archived');
@@ -49,4 +49,28 @@ test('removeEmptyParents removes the emptied folder and its empty parents, stops
   await removeEmptyParents(outsideLeaf, tmpRoot);
   assert.equal(fs.existsSync(outsideLeaf), true);
   assert.equal(fs.existsSync(outside), true);
+});
+
+test('removeEmptyParents works when the root itself ends with a separator, as a drive root does', async () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'rs-move-root-'));
+  const leaf = path.join(tmpRoot, 'drivers', 'hupkes');
+  fs.mkdirSync(leaf, { recursive: true });
+
+  await removeEmptyParents(leaf, tmpRoot + path.sep);
+
+  assert.equal(fs.existsSync(path.join(tmpRoot, 'drivers')), false);
+  assert.equal(fs.existsSync(tmpRoot), true);
+});
+
+test('uniqueDestination never overwrites: a free path is returned as is, a taken one gets a numbered sibling', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rs-unique-'));
+  const taken = path.join(dir, 'M_1.DDD');
+  fs.writeFileSync(taken, 'the older copy');
+
+  assert.equal(uniqueDestination(path.join(dir, 'free.ddd')), path.join(dir, 'free.ddd'));
+  assert.equal(uniqueDestination(taken), path.join(dir, 'M_1 (1).DDD'));
+
+  fs.writeFileSync(path.join(dir, 'M_1 (1).DDD'), 'also taken');
+  assert.equal(uniqueDestination(taken), path.join(dir, 'M_1 (2).DDD'));
+  assert.equal(fs.readFileSync(taken, 'utf8'), 'the older copy');
 });

@@ -44,7 +44,7 @@
   "failed_purpose": "Mislukte bestanden",
   "failed_contents": "Bestanden die het RoadSoft-platform definitief heeft afgewezen, en beschadigde archieven. Een bestand dat niet kon worden verzonden (netwerk- of serverfout) blijft in de synchronisatiemap staan en wordt bij de volgende synchronisatie opnieuw geprobeerd.",
   "note_file_processing": "Beide mappen worden automatisch aangemaakt in de geselecteerde synchronisatiemap. Ze worden uitgesloten van toekomstige scans, zodat bestanden die daar staan niet opnieuw worden verwerkt.",
-  "note_zip_trash": "Nadat een `.zip`-archief succesvol is uitgepakt, wordt het originele `.zip`-bestand automatisch naar de prullenbak van het besturingssysteem verplaatst en kan het indien nodig van daaruit worden hersteld.",
+  "note_zip_trash": "Nadat een `.zip`-archief succesvol is uitgepakt, wordt het originele `.zip`-bestand automatisch naar de prullenbak van het besturingssysteem verplaatst en kan het indien nodig van daaruit worden hersteld. Waar geen prullenbak beschikbaar is (bijvoorbeeld op een netwerkschijf), wordt het archief in plaats daarvan naar `Archived/` verplaatst. Er wordt nooit iets overschreven: een ouder bestand met dezelfde naam blijft bewaard en het nieuwere krijgt een genummerde naam.",
   "section_updates": "Updates & onderhoud",
   "autolaunch": "Automatisch starten bij opstarten wordt ondersteund en is configureerbaar in de applicatie",
   "tray": "Minimaliseren naar systeemvak wordt ondersteund (optioneel)"
