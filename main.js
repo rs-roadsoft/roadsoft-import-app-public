@@ -34,6 +34,7 @@ const { createApi, describeError } = require('./sync/api');
 const { planUpload, batchForUpload } = require('./sync/plan');
 const { buildUploadForm } = require('./sync/upload-form');
 const { classifyReceipt } = require('./sync/receipt');
+const { autoStartOnInstall } = require('./lib/auto-start');
 
 function getCustomHeaders() {
   return {
@@ -140,8 +141,15 @@ function createWindow(startMinimized = false) {
   // the sync with it: every run waited for the file-list reply that never came
   // and was skipped, until someone restarted the app.
   mainWindow.webContents.on('render-process-gone', (event, details) => {
+    // The renderer also goes when the whole app is shutting down; the window is
+    // destroyed by then and a reload would throw.
+    if (details.reason === 'clean-exit' || mainWindow.isDestroyed()) return;
     log.error(`Renderer process gone (${details.reason}); reloading the window`);
-    mainWindow.reload();
+    try {
+      mainWindow.reload();
+    } catch (error) {
+      log.error('Could not reload the window:', error);
+    }
   });
 
   if (startMinimized) {
@@ -233,15 +241,20 @@ app.whenReady().then(async () => {
   let autoStartEnabled = await dbConfig.getSetting('auto_start_enabled');
   const startMinimized = await dbConfig.getSetting('start_minimized');
 
-  // First start on this machine: auto-start is ON unless the user turns it off.
-  // Earlier versions left the setting unset on a fresh install, and `null` meant "do
-  // nothing", so after a server reboot the app did not come back until someone
-  // started it by hand (RS-6238). The 1.0.x builds enabled auto-launch on every
-  // start; this restores that default while keeping the checkbox as the opt-out.
-  if (autoStartEnabled === null || autoStartEnabled === undefined) {
-    autoStartEnabled = 'true';
+  // Every installation of a new version switches auto-start ON, also where it had
+  // been switched off: after a server reboot the app has to come back on its own
+  // (RS-6238). Switched off again afterwards, it stays off until the next version
+  // (lib/auto-start.js).
+  const installDefault = autoStartOnInstall({
+    autoStartEnabled,
+    storedVersion: await dbConfig.getSetting('app_version'),
+    currentVersion: app.getVersion(),
+  });
+  if (installDefault.changed) {
+    autoStartEnabled = installDefault.autoStartEnabled;
     try {
-      await dbConfig.setSetting('auto_start_enabled', 'true');
+      await dbConfig.setSetting('auto_start_enabled', installDefault.autoStartEnabled);
+      await dbConfig.setSetting('app_version', installDefault.storedVersion);
     } catch (error) {
       // A read-only or busy config.db must not leave the app without a window.
       log.error('Could not save the auto-start default:', error);

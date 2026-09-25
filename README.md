@@ -30,7 +30,7 @@ It provides automatic sync scheduling, local configuration storage (SQLite), and
   **stays in the folder** with the status _Not stored by the server_; the next run's server check moves it to
   **Failed** as _Rejected by server_
 - Supports automatic scheduled sync (every **1h / 12h / 24h** or **on app start**)
-- Local settings stored in **SQLite** database (Company ID, API key, folder, schedule, start-up options); auto-start is on by default and can be switched off in the app
+- Local settings stored in **SQLite** database (Company ID, API key, folder, schedule, start-up options); auto-start is switched on at every installation of a new version and can be switched off in the app until the next one
 - Minimize to tray and **auto-launch** on system startup
 - Cross-platform: **Windows** and **macOS**
 
