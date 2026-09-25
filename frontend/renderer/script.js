@@ -6,18 +6,29 @@ const fs = require('fs');
 const path = require('path');
 const extractZip = require('extract-zip');
 const trash = require('trash');
+// `__dirname` in the renderer is the folder of index.html (frontend/), so the
+// shared sync modules are one level up.
+const { moveTargetFor, removeEmptyParents, uniqueDestination } = require('../sync/move-target');
+// The walk rules — which folders are skipped, how deep, which extensions —
+// come from the same module the main process walks with, so the two can
+// never disagree about which files count.
+const gather = require('../sync/gather');
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-const MAX_SCAN_DEPTH = 10;
+const MAX_SCAN_DEPTH = gather.MAX_SCAN_DEPTH;
 
-const DIRS = Object.freeze({ ARCHIVED: 'Archived', FAILED: 'Failed' });
-const EXT = Object.freeze({ ZIP: '.zip', DDD: '.ddd', ESM: '.esm' });
+const DIRS = gather.DIRS;
+const EXT = Object.freeze({ ZIP: '.zip', ...gather.EXT });
 const BATCH_SIZE = 100;
 
 let connected = false;
 
 // Performance optimization: Set for O(1) lookup instead of O(n) DataTable search
 const addedFilePaths = new Set();
+// path -> DataTables row index, filled as rows are added. A status update used
+// to scan every row for its path: 6,200 files meant 6,200 scans of 6,200 rows
+// and a frozen window while the moves fell behind.
+const rowIndexByPath = new Map();
 // Batching: accumulate rows and flush every BATCH_SIZE
 let pendingRows = [];
 
@@ -29,6 +40,15 @@ const filesDataTable = $('#dtBasicExample').DataTable({
 $('.dataTables_length').addClass('bs-select');
 
 addLog('Welcome to RoadSoft File Sync Utility');
+
+// Async IPC handlers above are never awaited by Electron: a rejection inside
+// one used to vanish. Every such failure now lands in the window and main.log.
+window.addEventListener('unhandledrejection', (event) => {
+  addLog(`Unhandled error in the window: ${event.reason?.stack ?? event.reason?.message ?? event.reason}`);
+});
+window.addEventListener('error', (event) => {
+  addLog(`Error in the window: ${event.error?.stack ?? event.message}`);
+});
 
 // ============================ Initial settings ============================
 ipcRenderer.send('dbConfig:getPreset');
@@ -45,7 +65,7 @@ ipcRenderer.on('dbConfig:setPreset', (e, data) => {
     $(`#trigger option[value='${data.syncSchedule}']`).attr('selected', 'selected');
   }
   if (data.folderPath) {
-    getFilesFromFolder(data.folderPath);
+    getFilesFromFolder(data.folderPath).catch((err) => addLog(`Error scanning folder: ${err?.message}`));
   }
 });
 
@@ -56,6 +76,12 @@ setTimeout(() => {
 
 ipcRenderer.on('sync:changeStatusToProcessing', () => {
   changeStatusToProcessing();
+});
+
+// A run that stopped before any verdict (server unreachable, nothing readable)
+// leaves the spinners it started; put those rows back to "Not Synced".
+ipcRenderer.on('sync:changeStatusToIdle', () => {
+  setStatusWhere((status) => /Synchro/i.test(status), 'Not Synced');
 });
 
 // =============================== Connect =================================
@@ -77,23 +103,35 @@ $('#connect').on('click', function () {
   ipcRenderer.send('config:authenticate', { companyIdentifier, apiKey });
 });
 
-ipcRenderer.on('sync:updateFiles', () => {
+ipcRenderer.on('sync:updateFiles', async () => {
   const folderPath = $('#folder-path').text();
-  if (folderPath) {
-    getFilesFromFolder(folderPath);
+  try {
+    if (folderPath) {
+      await getFilesFromFolder(folderPath);
+    }
+  } catch (err) {
+    addLog(`Error scanning folder: ${err?.message}`);
+  } finally {
+    // The main process waits for this before it reads the folder: the rebuild
+    // above also extracts zip archives, and a file still being written must
+    // not be hashed and uploaded half-done. Sent on every path, so a scan
+    // error cannot leave the sync waiting.
+    ipcRenderer.send('sync:filesReady');
   }
 });
 
 ipcRenderer.on('config:success', () => {
   connected = true;
-  addLog('Connected');
+  // main.js logs 'Connected' itself; no echo into main.log
+  addLog('Connected', false);
 });
 
 ipcRenderer.on('config:error', (e, error) => {
+  // main.js logs 'Connect failed: <reason>' itself; no echo into main.log
   if (error) {
-    addLog(error);
+    addLog(error, false);
   } else {
-    addLog('Cannot connect');
+    addLog('Cannot connect', false);
   }
 });
 
@@ -105,7 +143,7 @@ $('#select-folder').on('click', async function () {
     const folderPath = pathDlg.filePaths[0];
 
     $('#folder-path').text(folderPath);
-    getFilesFromFolder(folderPath);
+    getFilesFromFolder(folderPath).catch((err) => addLog(`Error scanning folder: ${err?.message}`));
     ipcRenderer.send('dbConfig:setFolderPath', folderPath);
   }
 });
@@ -201,6 +239,12 @@ async function scanAndUnpack(rootPath, dirPath, depth) {
 
     const ext = path.extname(entry.name).toLowerCase();
     if (ext === EXT.ZIP) {
+      // Once per scan, whatever happens to it. The rescan below lists this folder
+      // again, and an archive that could not be taken out of it after extraction
+      // used to be extracted again, fail again and rescan again without end: the
+      // scan never finished, `sync:filesReady` never went out, every run was skipped.
+      if (handledZips.has(full)) continue;
+      handledZips.add(full);
       // snapshot before
       const beforeNames = new Set();
       try {
@@ -209,15 +253,25 @@ async function scanAndUnpack(rootPath, dirPath, depth) {
         addLog(`Error snapshotting dir ${dirPath}: ${snapErr.message}`);
       }
 
+      // Only a failed EXTRACTION means "corrupt archive". Trashing the zip and
+      // rescanning used to sit in the same try: an antivirus holding the zip
+      // for a second, or a volume with no recycle bin, threw here AFTER the
+      // extraction had succeeded, and the catch below then trashed every file
+      // the archive had just produced and filed a good archive as Failed/.
+      let extracted = false;
       try {
         // Extract into current directory
         await extractZip(full, { dir: dirPath });
-        // Move original archive to trash (recoverable)
-        await trash(full);
-        addLog(`[Unzip] Extracted ${entry.name}, original moved to trash`);
+        extracted = true;
+      } catch (zipErr) {
+        addLog(`[Unzip] Could not extract ${entry.name}: ${zipErr.message}`);
+      }
+
+      if (extracted) {
+        await retireArchive(rootPath, full, entry.name);
         // Rescan current directory (do not increase depth)
         await scanAndUnpack(rootPath, dirPath, depth);
-      } catch (zipErr) {
+      } else {
         // Cleanup any partially created items (STRICTLY within root) - move to trash
         let afterNames = [];
         try {
@@ -250,7 +304,8 @@ async function scanAndUnpack(rootPath, dirPath, depth) {
         if (!fs.existsSync(failedDir)) {
           fs.mkdirSync(failedDir);
         }
-        const failedTarget = path.join(failedDir, path.basename(full));
+        // Never over an earlier archive of the same name: nothing is overwritten.
+        const failedTarget = uniqueDestination(path.join(failedDir, path.basename(full)));
 
         // Guard: both src and dst must be within root (src is in dirPath which is under root)
         if (isPathInside(rootPath, failedTarget)) {
@@ -271,9 +326,64 @@ async function scanAndUnpack(rootPath, dirPath, depth) {
   }
 }
 
-async function getFilesFromFolder(folderPath) {
+/**
+ * Take an extracted archive out of the watched tree: to the recycle bin
+ * (recoverable), or, where there is none — a network share, a mapped drive —
+ * into Archived/ under its relative path. If even that fails the zip stays,
+ * logged; `handledZips` keeps this scan from touching it again, and the next
+ * scan tries once more.
+ */
+async function retireArchive(rootPath, zipPath, name) {
+  try {
+    await trash(zipPath);
+    addLog(`[Unzip] Extracted ${name}, original moved to trash`);
+    return;
+  } catch (trashErr) {
+    addLog(`[Unzip] Extracted ${name}, but the archive could not be moved to trash: ${trashErr.message}`);
+  }
+  try {
+    const dest = uniqueDestination(path.join(rootPath, DIRS.ARCHIVED, path.relative(rootPath, zipPath)));
+    await fs.promises.mkdir(path.dirname(dest), { recursive: true });
+    await fs.promises.rename(zipPath, dest);
+    addLog(`[Unzip] Archive moved to ${dest}`);
+  } catch (moveErr) {
+    addLog(`[Unzip] The archive could not be moved to ${DIRS.ARCHIVED}/ either, it stays in place: ${moveErr.message}`);
+  }
+}
+
+/**
+ * The scan in flight, if any, and the folder it walks. The table rebuild is
+ * requested from three places (the saved folder at start-up, every sync run,
+ * Select Folder), and at start-up two of them fire 1.5 s apart. Two walks over
+ * one tree reach the same zip: the first extracts and trashes it, the second
+ * cannot find it and would file it as corrupt. A caller asking for the folder
+ * being walked gets the running scan; a caller asking for ANOTHER folder gets
+ * a scan of that folder, queued behind the running one — it used to get the
+ * running scan and its folder was never listed or unzipped.
+ */
+let scanInFlight = null;
+let scanFolder = null;
+/** Archives this scan has already dealt with (see the zip branch of scanAndUnpack). */
+let handledZips = new Set();
+
+function getFilesFromFolder(folderPath) {
+  if (scanInFlight && scanFolder === folderPath) return scanInFlight;
+  const previous = scanInFlight ? scanInFlight.catch(() => {}) : Promise.resolve();
+  scanFolder = folderPath;
+  const tracked = previous
+    .then(() => rebuildFileTable(folderPath))
+    .finally(() => {
+      if (scanInFlight === tracked) scanInFlight = null;
+    });
+  scanInFlight = tracked;
+  return tracked;
+}
+
+async function rebuildFileTable(folderPath) {
   // Rebuild table (fresh list of files)
   filesDataTable.clear().draw();
+  rowIndexByPath.clear();
+  handledZips = new Set();
 
   // Clear tracking Set and pending batch for fresh scan
   addedFilePaths.clear();
@@ -294,16 +404,19 @@ function addNewFile(fullPath, relativeDisplay) {
   addedFilePaths.add(fullPath);
 
   // Accumulate row data for batching
-  pendingRows.push([
-    // Hidden cell with absolute path for easy lookup
-    `<span style="display:none" class="file-fullpath" data-path="${escapeHtml(
-      fullPath,
-    )}">${escapeHtml(fullPath)}</span>`,
-    // Visible name
-    `<i class="fa fa-file-text"></i>&nbsp;&nbsp; ${escapeHtml(relativeDisplay)}`,
-    // Status
-    'Not Synced',
-  ]);
+  pendingRows.push({
+    path: fullPath,
+    cells: [
+      // Hidden cell with absolute path for easy lookup
+      `<span style="display:none" class="file-fullpath" data-path="${escapeHtml(
+        fullPath,
+      )}">${escapeHtml(fullPath)}</span>`,
+      // Visible name
+      `<i class="fa fa-file-text"></i>&nbsp;&nbsp; ${escapeHtml(relativeDisplay)}`,
+      // Status
+      'Not Synced',
+    ],
+  });
 
   // Flush batch when reaching BATCH_SIZE
   if (pendingRows.length >= BATCH_SIZE) {
@@ -317,7 +430,9 @@ function addNewFile(fullPath, relativeDisplay) {
  */
 function flushPendingRows() {
   if (pendingRows.length === 0) return;
-  pendingRows.forEach((row) => filesDataTable.row.add(row));
+  pendingRows.forEach((row) => {
+    rowIndexByPath.set(row.path, filesDataTable.row.add(row.cells).index());
+  });
   filesDataTable.draw(false);
   pendingRows = [];
 }
@@ -359,16 +474,26 @@ $('#sync-now').on('click', function () {
    TABLE STATUS UPDATES
    ========================================================================= */
 
+/**
+ * Set the status cell of every row whose current status passes `test`, then
+ * redraw ONCE. A redraw per row re-sorts and re-renders the whole table each
+ * time: on a 6,000-row folder that was seconds of a frozen window at the start
+ * of every run and again when a run was postponed.
+ */
+function setStatusWhere(test, statusHtml) {
+  filesDataTable.rows().every(function () {
+    const data = this.data();
+    if (test(String(data[2]))) this.data([data[0], data[1], statusHtml]);
+  });
+  filesDataTable.draw(false);
+}
+
 /** Flip all rows to "Synchronizing" at sync start (row-wise, not a full rebuild). */
 function changeStatusToProcessing() {
-  filesDataTable.rows((idx, data) => {
-    if (data[2] === 'Not Synced' || /Synchro/i.test(String(data[2]))) {
-      filesDataTable
-        .row(idx)
-        .data([data[0], data[1], '<i class="fa fa-refresh fa-spin"></i>&nbsp;&nbsp; Synchronizing'])
-        .draw(false);
-    }
-  });
+  setStatusWhere(
+    (status) => status === 'Not Synced' || /Synchro/i.test(status),
+    '<i class="fa fa-refresh fa-spin"></i>&nbsp;&nbsp; Synchronizing',
+  );
 }
 
 /**
@@ -395,11 +520,21 @@ async function removePathRecursiveSyncSafe(targetPath, rootGuard) {
 /**
  * Per-file status update:
  * - find the row by hidden absolute path cell
- * - move file or its top-level folder to Archived/Failed (ONLY within chosen root)
+ * - move the settled file to Archived/Failed, keeping its relative path (ONLY within chosen root)
  * - update only that row's status
  * - overwrite behavior is atomic: delete destination first, with root guard
  */
 ipcRenderer.on('sync:updateStatus', async function (event, data) {
+  movesInFlight += 1;
+  try {
+    await applyStatus(data);
+  } finally {
+    movesInFlight -= 1;
+    reportMoveFailuresIfDone();
+  }
+});
+
+async function applyStatus(data) {
   const absoluteFilePath = data.fileName;
   const rootFolder = $('#folder-path').text();
 
@@ -410,96 +545,120 @@ ipcRenderer.on('sync:updateStatus', async function (event, data) {
   // Guard 1: never operate on a file outside of the chosen root
   if (!isPathInside(rootResolved, fileResolved)) {
     addLog(`[Guard] Skip moving outside root: ${absoluteFilePath}`);
+    // The folder was changed while a run was in flight: the file stays where
+    // it is, which the end-of-run line must say rather than "Successfully synced".
+    if (data.move !== false) noteMoveFailure();
   } else {
-    const escapedFilePath = escapeHtml(absoluteFilePath);
-    const rowIndexes = filesDataTable
-      .rows()
-      .indexes()
-      .filter(function (value) {
-        const rowData = filesDataTable.row(value).data();
-        return rowData[0].includes(escapedFilePath);
-      });
-
-    // Move file/folder into Archived or Failed
+    // Move the settled file into Archived or Failed, keeping its relative path.
+    // Only the file itself moves — never its folder. Moving the whole top-level
+    // folder on the first settled file took every not-yet-uploaded sibling with
+    // it (RS-7303): on Windows the rename failed with EPERM while the main
+    // process still streamed the next batch from inside it, or it succeeded and
+    // the later batches failed with ENOENT, their files stranded in Archived/.
     const targetType = data.status === 'Synced' ? DIRS.ARCHIVED : DIRS.FAILED;
+    // Archived/ and Failed/ themselves exist since the scan (`ensureSpecialFolders`);
+    // the destination's own folder chain is created, inside the try, below.
     const targetRootDir = path.join(rootResolved, targetType);
-    if (!fs.existsSync(targetRootDir)) {
-      fs.mkdirSync(targetRootDir);
-    }
 
-    if (fs.existsSync(fileResolved)) {
-      const relFromRoot = path.relative(rootResolved, fileResolved);
-      const parts = relFromRoot.split(path.sep).filter(Boolean); // drop empty parts
+    // `move: false` — the request itself failed or the server's answer was not
+    // understood, so the file has no verdict yet: it stays in the folder and is
+    // offered again next run. Only a settled file moves.
+    if (data.move !== false && fs.existsSync(fileResolved)) {
+      const target = moveTargetFor(rootResolved, fileResolved, targetRootDir);
 
-      if (parts.length === 1) {
-        // Top-level file
-        const destFilePath = path.join(targetRootDir, path.basename(fileResolved));
-
-        // Guard 2: destination must be inside targetRootDir
-        if (isPathInside(targetRootDir, destFilePath) || realResolve(destFilePath) === realResolve(targetRootDir)) {
-          // Ensure overwrite semantics on all platforms
+      if (!target) {
+        addLog(`[Guard] Refuse to move: ${fileResolved} is the root or lies outside it`);
+        noteMoveFailure();
+      } else if (!isPathInside(targetRootDir, target.destFilePath)) {
+        // Guard 2: destination must be inside targetRootDir (realpath-based, symlink-safe)
+        addLog(`[Guard] Refuse to move file outside target dir: ${target.destFilePath}`);
+        noteMoveFailure();
+      } else {
+        // Everything that touches the disk is inside the try: a mkdir that
+        // throws (a path over Windows' 260-character limit once `Archived\` is
+        // prepended, EACCES, ENOSPC) used to escape this async handler as an
+        // unhandled rejection — no log line, no status, the row spinning for ever.
+        try {
+          fs.mkdirSync(path.dirname(target.destFilePath), { recursive: true });
+          // Guard 2 above saw a path that did not exist yet, which realpath cannot
+          // follow: a junction planted inside Archived/ or Failed/ passed it. Now
+          // the folder exists and resolves through any link.
+          if (!isPathInside(targetRootDir, path.dirname(target.destFilePath))) {
+            throw new Error(`destination folder resolves outside ${targetType}/: ${path.dirname(target.destFilePath)}`);
+          }
+          // An older copy with the same name goes to the recycle bin first
+          // (recoverable). Where there is no bin the older copy stays and the
+          // new one takes a numbered name beside it: `rename` would otherwise
+          // overwrite it, and nothing here may be lost for good.
+          let destFilePath = target.destFilePath;
           if (fs.existsSync(destFilePath)) {
             await removePathRecursiveSyncSafe(destFilePath, rootResolved);
+            if (fs.existsSync(destFilePath)) destFilePath = uniqueDestination(destFilePath);
           }
-          try {
-            await fs.promises.rename(fileResolved, destFilePath);
-          } catch (err) {
-            addLog(`Error moving file: ${err?.message}`);
-          }
-        } else {
-          addLog(`[Guard] Refuse to move top-level file outside target dir: ${destFilePath}`);
-        }
-      } else {
-        // File is inside a subfolder: move entire top-level folder
-        const topLevelFolderName = parts[0];
-
-        // Guard 3: first segment cannot be "." or ".." and must be a plain name
-        if (!topLevelFolderName || topLevelFolderName === '.' || topLevelFolderName === '..') {
-          addLog(`[Guard] Invalid top-level name for move: "${topLevelFolderName}" from ${relFromRoot}`);
-        } else {
-          const srcTopFolderPath = path.join(rootResolved, topLevelFolderName);
-          const destTopFolderPath = path.join(targetRootDir, topLevelFolderName);
-
-          // Guard 4: both src and dest must be inside root / targetRootDir respectively
-          const srcOk =
-            isPathInside(rootResolved, srcTopFolderPath) || realResolve(srcTopFolderPath) === realResolve(rootResolved);
-          const dstOk =
-            isPathInside(targetRootDir, destTopFolderPath) ||
-            realResolve(destTopFolderPath) === realResolve(targetRootDir);
-
-          if (srcOk && dstOk && fs.existsSync(srcTopFolderPath)) {
-            if (fs.existsSync(destTopFolderPath)) {
-              await removePathRecursiveSyncSafe(destTopFolderPath, rootResolved);
-            }
-            try {
-              await fs.promises.rename(srcTopFolderPath, destTopFolderPath);
-            } catch (err) {
-              addLog(`Error moving folder: ${err?.message}`);
-            }
-          } else {
-            addLog(
-              `[Guard] Refuse to move folder. srcOk=${srcOk} dstOk=${dstOk} src=${srcTopFolderPath} dst=${destTopFolderPath}`,
-            );
-          }
+          await fs.promises.rename(fileResolved, destFilePath);
+          // The folder the file came from goes too once it is empty — one folder
+          // per driver is a common layout, and it vanished on sync in earlier versions.
+          await removeEmptyParents(path.dirname(fileResolved), rootResolved);
+        } catch (err) {
+          addLog(`Error moving file ${fileResolved}: ${err?.message}`);
+          noteMoveFailure();
         }
       }
     }
 
-    if (rowIndexes && rowIndexes.length > 0) {
-      const rowIdx = rowIndexes[0];
+    // Looked up AFTER the move, not before it: the table may have been rebuilt
+    // while the rename was in flight (Sync Now, Select Folder), and an index
+    // taken earlier then pointed at some other file's row — or at no row.
+    // Rows are keyed by the resolved root, main.js sends the path as configured;
+    // the two differ only through a symlinked or differently-cased root.
+    const rowIdx = rowIndexByPath.get(absoluteFilePath) ?? rowIndexByPath.get(fileResolved);
+    if (rowIdx !== undefined) {
       const rowData = filesDataTable.row(rowIdx).data();
-      filesDataTable.row(rowIdx).data([rowData[0], rowData[1], data.status]).draw(false);
+      // `label` is the server's word for the file when there is one ("Already on
+      // server", "Rejected by server"); `status` stays the move selector above.
+      filesDataTable
+        .row(rowIdx)
+        .data([rowData[0], rowData[1], escapeHtml(data.label ?? data.status)])
+        .draw(false);
     }
   }
-});
+}
 
 // ================================ System logs =============================
 ipcRenderer.on('system:log', function (event, data) {
-  addLog(data);
+  addLog(data, false);
 });
+
+/**
+ * Moves happen here, after the main process has already printed its summary:
+ * a file that could not be moved was reported "Successfully synced" with
+ * nothing anywhere saying it is still in the folder — the silence RS-7317 sat
+ * behind. Failures are counted per run and printed as one line once the run's
+ * last move has finished; the line reaches main.log through `addLog`.
+ */
+let moveFailures = 0;
+let movesInFlight = 0;
+let runEnded = false;
+
+function noteMoveFailure() {
+  moveFailures += 1;
+}
+
+function reportMoveFailuresIfDone() {
+  if (!runEnded || movesInFlight > 0) return;
+  if (moveFailures > 0) {
+    addLog(`Could not move ${moveFailures} file(s) — they stay in the folder; see the lines above for the reasons`);
+  }
+  moveFailures = 0;
+  runEnded = false;
+}
 
 ipcRenderer.on('system:update-last-sync', function (event, data) {
   $('#last-sync').text(data);
+  // Sent after the last status of the run: the move report can go out once
+  // the moves still in flight have finished.
+  runEnded = true;
+  reportMoveFailuresIfDone();
 });
 
 // ============================== Quick open links ==========================
@@ -514,24 +673,20 @@ $('#folder-path').on('click', function (e) {
 
 $('#open-log').on('click', function (e) {
   e.preventDefault();
-
-  const logFilePath = path.join(app.getPath('userData'), 'log.txt');
-
-  if (!fs.existsSync(logFilePath)) {
-    return;
-  }
-
-  // Always open local log.txt in CWD as before
-  shell.openPath(logFilePath);
+  // The folder, not one file: it holds log.txt (per-file results) and
+  // logs/main.log (the app's own log) — "send me what is in this folder".
+  shell.openPath(app.getPath('userData'));
 });
 
 /* =========================================================================
    MISC HELPERS
    ========================================================================= */
 
-function addLog(msg) {
+function addLog(msg, toFile = true) {
   $('#logArea').append(msg + '\n');
   $('#logArea').scrollTop($('#logArea')[0].scrollHeight);
+  // Lines that came FROM the main process are already in main.log.
+  if (toFile) ipcRenderer.send('log:write', String(msg));
 }
 
 ipcRenderer.send('app:getVersion');
